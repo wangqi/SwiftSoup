@@ -6,7 +6,9 @@
 //  Copyright © 2017 Nabil. All rights reserved.
 //
 
+#if canImport(UIKit)
 import UIKit
+#endif
 
 @UIApplicationMain
 class AppDelegate: UIResponder, UIApplicationDelegate {

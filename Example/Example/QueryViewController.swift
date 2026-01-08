@@ -6,7 +6,9 @@
 //  Copyright © 2018 Nabil. All rights reserved.
 //
 
+#if canImport(UIKit)
 import UIKit
+#endif
 
 class QueryViewControllerCell: UITableViewCell {
     @IBOutlet weak var selector: UILabel!
