@@ -821,6 +821,35 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
                             tb.framesetOk(false)
                             return true
                         }
+                        // `input` is a void element, but the "in body" insertion mode had no branch
+                        // for it, so it fell through to the generic `tb.insert` at the end of this
+                        // method and was pushed onto the stack of open elements. With no `</input>`
+                        // ever arriving, every following sibling became its CHILD: on a real search
+                        // page one hidden `<input>` swallowed the whole document, and a caller that
+                        // strips `input` as noise then deleted the entire page. `Tag.emptyTags`
+                        // already lists `input`; only this dispatch was missing. Matches jsoup's
+                        // own `case "input"` in InBody.
+                        // wangqi modified 2026-08-30
+                        if tagId == .input {
+                            if ensureHasFormatting() {
+                                try tb.reconstructFormattingElements()
+                            }
+                            // Same `type=hidden` read as the InTable branch below, so the two
+                            // agree on what "hidden" means.
+                            let isHidden: Bool
+                            if startTag.hasAnyAttributes() {
+                                startTag.ensureAttributes()
+                                let typeValue = startTag._attributes?.get(key: UTF8Arrays.type) ?? []
+                                isHidden = typeValue.equalsIgnoreCase(string: UTF8Arrays.hidden)
+                            } else {
+                                isHidden = false
+                            }
+                            try tb.insertEmpty(startTag)
+                            if !isHidden {
+                                tb.framesetOk(false)
+                            }
+                            return true
+                        }
                         if Constants.InBodyStartPClosers.containsTagId(tagId) {
                             if (try tb.inButtonScope(UTF8Arrays.p)) {
                                 try tb.processEndTag(UTF8Arrays.p)
@@ -915,6 +944,26 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
                             }
                             try tb.insertEmpty(startTag)
                             tb.framesetOk(false)
+                        // The same missing `input` rule on the name-slice path, which is what runs
+                        // when the token carries no resolved tagId. Every other rule in this method
+                        // is duplicated across both paths; this one has to be too.
+                        // wangqi modified 2026-08-30
+                        } else if equalsSlice(UTF8Arrays.input, nameSlice) {
+                            if ensureHasFormatting() {
+                                try tb.reconstructFormattingElements()
+                            }
+                            let isHidden: Bool
+                            if startTag.hasAnyAttributes() {
+                                startTag.ensureAttributes()
+                                let typeValue = startTag._attributes?.get(key: UTF8Arrays.type) ?? []
+                                isHidden = typeValue.equalsIgnoreCase(string: UTF8Arrays.hidden)
+                            } else {
+                                isHidden = false
+                            }
+                            try tb.insertEmpty(startTag)
+                            if !isHidden {
+                                tb.framesetOk(false)
+                            }
                         } else if Constants.InBodyStartPClosers.contains(nameSlice) {
                             if (try tb.inButtonScope(UTF8Arrays.p)) {
                                 try tb.processEndTag(UTF8Arrays.p)
