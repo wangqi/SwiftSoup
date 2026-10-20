@@ -117,6 +117,10 @@ open class Attributes: NSCopying {
             } else {
                 return
             }
+            // Drop an attribute whose name is empty after trimming (e.g. a lone U+000B, which the tokeniser keeps as a name but trim() strips): the try! below trapped on it // wangqi modified 2026-10-20
+            if keySlice?.isEmpty == true || keyBytes?.isEmpty == true {
+                return
+            }
             let attribute: Attribute
             switch pending.value {
             case .none:
@@ -220,6 +224,10 @@ open class Attributes: NSCopying {
                 keyBytes = nil
                 keySlice = nameSlice.trim()
             } else {
+                continue
+            }
+            // Drop an attribute whose name is empty after trimming (e.g. a lone U+000B, which the tokeniser keeps as a name but trim() strips): the try! below trapped on it // wangqi modified 2026-10-20
+            if keySlice?.isEmpty == true || keyBytes?.isEmpty == true {
                 continue
             }
             switch pendingAttr.value {

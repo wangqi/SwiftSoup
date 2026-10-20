@@ -158,7 +158,20 @@ open class Node: Equatable, Hashable {
         self.attributes = nil
         self.baseUri = nil
     }
-    
+
+    // Release the subtree with an explicit stack: the default deinit frees each child from inside its parent's deinit, which overflowed the stack on deeply nested input (~5000 levels on a 512 KB thread). A child still referenced elsewhere keeps its own children. // wangqi modified 2026-10-20
+    deinit {
+        guard !childNodes.isEmpty else { return }
+        var pending = childNodes
+        childNodes.removeAll()
+        while var node = pending.popLast() {
+            if isKnownUniquelyReferenced(&node), !node.childNodes.isEmpty {
+                pending.append(contentsOf: node.childNodes)
+                node.childNodes.removeAll()
+            }
+        }
+    }
+
     /**
      Get the node name of this node. Use for debugging purposes and not logic switching (for that, use instanceof).
      - returns: node name
@@ -484,14 +497,18 @@ open class Node: Equatable, Hashable {
     @inline(__always)
     @usableFromInline
     internal func markSourceDirty(force: Bool = false) {
-        if sourceRangeDirty {
-            return
+        // Walk the ancestors in a loop instead of recursing: one frame per ancestor overflowed the stack on deeply nested input (~5000 levels on a 512 KB thread) // wangqi modified 2026-10-20
+        var current: Node? = self
+        while let node = current {
+            if node.sourceRangeDirty {
+                return
+            }
+            if !force, node.treeBuilder?.isBulkBuilding == true {
+                return
+            }
+            node.sourceRangeDirty = true
+            current = node.parentNode
         }
-        if !force, treeBuilder?.isBulkBuilding == true {
-            return
-        }
-        sourceRangeDirty = true
-        parentNode?.markSourceDirty(force: force)
     }
 
     @inline(__always)
@@ -992,17 +1009,29 @@ open class Node: Equatable, Hashable {
 
     @inline(__always)
     private func outerHtmlFast(_ accum: StringBuilder, _ depth: Int, _ out: OutputSettings, allowRawSource: Bool) throws {
+        // Same head / children / tail order as before, driven by an explicit stack instead of one recursive call per level: deeply nested input (~2000 levels on a 512 KB thread) overflowed the stack // wangqi modified 2026-10-20
         if let raw = rawSourceSlice(out, allowRawSource: allowRawSource) {
             accum.append(raw)
             return
         }
         try outerHtmlHead(accum, depth, out)
-        if !childNodes.isEmpty {
-            for child in childNodes {
-                try child.outerHtmlFast(accum, depth + 1, out, allowRawSource: allowRawSource)
+        var stack: [(node: Node, depth: Int, nextChild: Int)] = [(self, depth, 0)]
+        while let top = stack.last {
+            let children = top.node.childNodes
+            if top.nextChild < children.count {
+                stack[stack.count - 1].nextChild += 1
+                let child = children[top.nextChild]
+                if let raw = child.rawSourceSlice(out, allowRawSource: allowRawSource) {
+                    accum.append(raw)
+                    continue
+                }
+                try child.outerHtmlHead(accum, top.depth + 1, out)
+                stack.append((child, top.depth + 1, 0))
+            } else {
+                try top.node.outerHtmlTail(accum, top.depth, out)
+                stack.removeLast()
             }
         }
-        try outerHtmlTail(accum, depth, out)
     }
     
     /**
