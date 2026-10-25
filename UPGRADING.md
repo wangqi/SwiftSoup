@@ -3,7 +3,20 @@
 Local changes to the vendored SwiftSoup. Re-apply these after any upstream merge; each is also
 marked in the source with `// wangqi modified YYYY-MM-DD`.
 
-## 2026-08-30 — `HtmlTreeBuilderState.swift`: `<input>` is a void element in `InBody`
+## 2026-10-25 upstream merge (296 commits, base f2c4714) — what changed in this file's list
+
+* **Dropped, upstream absorbed them:** the `<input>` void fix below (upstream 8fcecf0, #388, same
+  semantics on the `tagId` switch and the name-slice chain); the 2026-10-20 iterative `Node.deinit`
+  (7c9a40b, #396), iterative `markSourceDirty` and `outerHtmlFast` (0187a0d, #466); the 2026-10-20
+  drop of attributes whose name is empty after trimming (d33de7b, #392, `normalizedKey()` + `try?`).
+  `Attributes.swift` and `Node.swift` are now identical to upstream.
+* **Restored:** upstream #388 also flipped the three `InBody` `insertForm(startTag, …)` calls to
+  `true`. The fork holds them at `false` (marked `// wangqi modified 2026-10-25`) for the reason in
+  the last section. Upstream's `FormElementTest` cases that expect a form to parent its controls
+  fail on this fork by design.
+* **Kept, not source:** `.gitignore` (`.swiftpm`, `build`), `Example/` `#if canImport(UIKit)`.
+
+## 2026-08-30 — `HtmlTreeBuilderState.swift`: `<input>` is a void element in `InBody` (absorbed upstream 2026-10-25)
 
 `Tag.emptyTags` already lists `input`, but the "in body" insertion mode had no branch for it, so it
 fell through to the generic `tb.insert(startTag)` and was pushed onto the stack of open elements.
@@ -34,7 +47,7 @@ inserted but never becomes the current node, so **a form's children are parented
 parent** and the form itself comes out empty. (`false` is correct at the two `InTable` sites, where
 jsoup also keeps the form off the stack.)
 
-This was fixed and then **reverted on purpose**. `form` is in
+This was fixed and then **reverted on purpose**, and upstream's own fix (8fcecf0, #388) is held back the same way. `form` is in
 `MarkdownConverter.defaultIgnoringTags`, so `cleanDocument` runs `select("form").remove()`. While
 the tree is wrong that call removes an empty shell and costs nothing; with a correct tree it deletes
 the entire subtree. Auditing the callers, that would silently empty:
