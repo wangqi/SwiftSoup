@@ -76,6 +76,19 @@ open class Collector {
         if let fast = try simpleEvaluatorFastPath(eval, root: root) {
             return fast
         }
+        // A selector group (`a, b`) used to fall through to the DFS below, so every element ran every
+        // branch in written order and the indexed seeding above never applied: a branch led by
+        // `*:not(:has(...))` walked each element's whole subtree, O(n^2) on a deep tree (10,000 nested
+        // spans took 80 s in a debug build). Collect each branch through the indexed paths, then emit
+        // the union once in document order. Built-in evaluator graphs only (as for And seeding); a
+        // branch that throws falls back to the DFS, which keeps Or.matches' catch-and-continue.
+        // wangqi modified 2026-10-25
+        if let orEval = eval as? CombiningEvaluator.Or,
+           orEval.evaluators.count > 1,
+           orEval.supportsIndexedCandidateFiltering,
+           let union = try? collectOrBranches(orEval, root: root) {
+            return union
+        }
         // Manual DFS to reduce NodeTraversor/visitor overhead in hot selector paths.
         var stack: ContiguousArray<Element> = []
         stack.reserveCapacity(root.childNodes.count + 1)
@@ -83,6 +96,40 @@ open class Collector {
         while let el = stack.popLast() {
             let matched = try eval.matches(root, el)
             if matched {
+                elements.add(el)
+            }
+            let children = el.childNodes
+            var i = children.count
+            while i > 0 {
+                i &-= 1
+                if let childEl = children[i] as? Element {
+                    stack.append(childEl)
+                }
+            }
+        }
+        return elements
+    }
+
+    // Union of an Or's branches in document order, each element once (what the DFS over Or.matches
+    // returns). Returns early with an empty result when no branch matched.
+    // wangqi modified 2026-10-25
+    private static func collectOrBranches(_ orEval: CombiningEvaluator.Or, root: Element) throws -> Elements {
+        var matched = Set<ObjectIdentifier>()
+        for branch in orEval.evaluators {
+            for el in try collect(branch, root).array() {
+                matched.insert(ObjectIdentifier(el))
+            }
+        }
+        let elements = Elements()
+        if matched.isEmpty {
+            return elements
+        }
+        elements.reserveCapacity(matched.count)
+        var stack: ContiguousArray<Element> = []
+        stack.reserveCapacity(root.childNodes.count + 1)
+        stack.append(root)
+        while let el = stack.popLast() {
+            if matched.contains(ObjectIdentifier(el)) {
                 elements.add(el)
             }
             let children = el.childNodes
