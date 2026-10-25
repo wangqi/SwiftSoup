@@ -34,6 +34,14 @@ open class StringUtil {
     }
 
     @inline(__always)
+    static func isAscii(_ bytes: ByteSlice) -> Bool {
+        for b in bytes where b >= 128 {
+            return false
+        }
+        return true
+    }
+
+    @inline(__always)
     static func hasPrefixIgnoreCaseAscii(_ bytes: [UInt8], _ prefix: [UInt8]) -> Bool {
         if prefix.count > bytes.count { return false }
         var i = 0
@@ -47,7 +55,33 @@ open class StringUtil {
     }
 
     @inline(__always)
+    static func hasPrefixIgnoreCaseAscii(_ bytes: ByteSlice, _ prefix: [UInt8]) -> Bool {
+        if prefix.count > bytes.count { return false }
+        var i = 0
+        while i < prefix.count {
+            if Attributes.asciiLowercase(bytes[i]) != Attributes.asciiLowercase(prefix[i]) {
+                return false
+            }
+            i &+= 1
+        }
+        return true
+    }
+
+    @inline(__always)
     static func hasPrefixLowercaseAscii(_ bytes: [UInt8], _ lowerPrefix: [UInt8]) -> Bool {
+        if lowerPrefix.count > bytes.count { return false }
+        var i = 0
+        while i < lowerPrefix.count {
+            if Attributes.asciiLowercase(bytes[i]) != lowerPrefix[i] {
+                return false
+            }
+            i &+= 1
+        }
+        return true
+    }
+
+    @inline(__always)
+    static func hasPrefixLowercaseAscii(_ bytes: ByteSlice, _ lowerPrefix: [UInt8]) -> Bool {
         if lowerPrefix.count > bytes.count { return false }
         var i = 0
         while i < lowerPrefix.count {
@@ -74,7 +108,35 @@ open class StringUtil {
     }
 
     @inline(__always)
+    static func hasSuffixIgnoreCaseAscii(_ bytes: ByteSlice, _ suffix: [UInt8]) -> Bool {
+        if suffix.count > bytes.count { return false }
+        let offset = bytes.count - suffix.count
+        var i = 0
+        while i < suffix.count {
+            if Attributes.asciiLowercase(bytes[offset + i]) != Attributes.asciiLowercase(suffix[i]) {
+                return false
+            }
+            i &+= 1
+        }
+        return true
+    }
+
+    @inline(__always)
     static func hasSuffixLowercaseAscii(_ bytes: [UInt8], _ lowerSuffix: [UInt8]) -> Bool {
+        if lowerSuffix.count > bytes.count { return false }
+        let offset = bytes.count - lowerSuffix.count
+        var i = 0
+        while i < lowerSuffix.count {
+            if Attributes.asciiLowercase(bytes[offset + i]) != lowerSuffix[i] {
+                return false
+            }
+            i &+= 1
+        }
+        return true
+    }
+
+    @inline(__always)
+    static func hasSuffixLowercaseAscii(_ bytes: ByteSlice, _ lowerSuffix: [UInt8]) -> Bool {
         if lowerSuffix.count > bytes.count { return false }
         let offset = bytes.count - lowerSuffix.count
         var i = 0
@@ -112,7 +174,68 @@ open class StringUtil {
     }
 
     @inline(__always)
+    static func containsIgnoreCaseAscii(_ bytes: ByteSlice, _ needle: [UInt8]) -> Bool {
+        let hayCount = bytes.count
+        let needleCount = needle.count
+        if needleCount == 0 { return true }
+        if needleCount > hayCount { return false }
+        let limit = hayCount - needleCount
+        var i = 0
+        while i <= limit {
+            var j = 0
+            while j < needleCount {
+                if Attributes.asciiLowercase(bytes[i + j]) != Attributes.asciiLowercase(needle[j]) {
+                    break
+                }
+                j &+= 1
+            }
+            if j == needleCount {
+                return true
+            }
+            i &+= 1
+        }
+        return false
+    }
+
+    @inline(__always)
+    static func equalsIgnoreCase(_ lhs: [UInt8], _ rhs: ByteSlice) -> Bool {
+        if lhs.count != rhs.count { return false }
+        var i = 0
+        for b in rhs {
+            if Attributes.asciiLowercase(b) != Attributes.asciiLowercase(lhs[i]) {
+                return false
+            }
+            i &+= 1
+        }
+        return true
+    }
+
+    @inline(__always)
     static func containsLowercaseAscii(_ bytes: [UInt8], _ lowerNeedle: [UInt8]) -> Bool {
+        let hayCount = bytes.count
+        let needleCount = lowerNeedle.count
+        if needleCount == 0 { return true }
+        if needleCount > hayCount { return false }
+        let limit = hayCount - needleCount
+        var i = 0
+        while i <= limit {
+            var j = 0
+            while j < needleCount {
+                if Attributes.asciiLowercase(bytes[i + j]) != lowerNeedle[j] {
+                    break
+                }
+                j &+= 1
+            }
+            if j == needleCount {
+                return true
+            }
+            i &+= 1
+        }
+        return false
+    }
+
+    @inline(__always)
+    static func containsLowercaseAscii(_ bytes: ByteSlice, _ lowerNeedle: [UInt8]) -> Bool {
         let hayCount = bytes.count
         let needleCount = lowerNeedle.count
         if needleCount == 0 { return true }
@@ -231,13 +354,18 @@ open class StringUtil {
      * - returns: if string is blank
      */
     public static func isBlank(_ string: String) -> Bool {
-        if (string.isEmpty) {
-            return true
-        }
+        return isBlankTextBytes(string.utf8)
+    }
 
-        for chr in string {
-            if (!StringUtil.isWhitespace(chr)) {
-                return false
+    // CharacterExt's whitespace set consists only of these ASCII scalars
+    // (including the CRLF Character). Any other byte makes the text nonblank,
+    // including malformed UTF-8, which String(decoding:) would replace.
+    @inline(__always)
+    static func isBlankTextBytes<Bytes: Collection>(_ bytes: Bytes) -> Bool where Bytes.Element == UInt8 {
+        for byte in bytes {
+            switch byte {
+            case 0x09, 0x0A, 0x0C, 0x0D, 0x20: continue
+            default: return false
             }
         }
         return true
@@ -316,6 +444,17 @@ open class StringUtil {
     public static func normaliseWhitespace(_ string: ArraySlice<UInt8>) -> String {
         if !needsWhitespaceNormalization(string) {
             return String(decoding: string, as: UTF8.self)
+        }
+        let sb: StringBuilder = StringBuilder(string.count)
+        appendNormalisedWhitespace(sb, string: string, stripLeading: false)
+        return sb.toString()
+    }
+
+    static func normaliseWhitespace(_ string: ByteSlice) -> String {
+        if !needsWhitespaceNormalization(string) {
+            return string.withUnsafeBytes { buf in
+                return String(decoding: buf, as: UTF8.self)
+            }
         }
         let sb: StringBuilder = StringBuilder(string.count)
         appendNormalisedWhitespace(sb, string: string, stripLeading: false)
@@ -450,6 +589,30 @@ open class StringUtil {
         return false
     }
 
+    @inline(__always)
+    private static func needsWhitespaceNormalization(_ string: ByteSlice) -> Bool {
+        var lastWasWhitespace = false
+        var i = 0
+        let count = string.count
+        while i < count {
+            let byte = string[i]
+            if byte == TokeniserStateVars.spaceByte ||
+                byte == TokeniserStateVars.tabByte ||
+                byte == TokeniserStateVars.newLineByte ||
+                byte == TokeniserStateVars.formFeedByte ||
+                byte == TokeniserStateVars.carriageReturnByte {
+                if byte != TokeniserStateVars.spaceByte || lastWasWhitespace {
+                    return true
+                }
+                lastWasWhitespace = true
+            } else {
+                lastWasWhitespace = false
+            }
+            i &+= 1
+        }
+        return false
+    }
+
     
 
     @inlinable
@@ -576,6 +739,26 @@ open class StringUtil {
         }
     }
 
+    @inline(__always)
+    static func appendNormalisedWhitespace(_ accum: StringBuilder,
+                                                  string: ByteSlice,
+                                                  stripLeading: Bool) {
+        if string.isEmpty { return }
+        var lastWasWhite = false
+        var sawWhitespace = false
+        string.withUnsafeBytes { buf in
+            guard let basePtr = buf.baseAddress else { return }
+            appendNormalisedWhitespaceBytes(
+                accum,
+                basePtr: basePtr,
+                count: buf.count,
+                stripLeading: stripLeading,
+                lastWasWhite: &lastWasWhite,
+                sawWhitespace: &sawWhitespace
+            )
+        }
+    }
+
     @inlinable
     public static func appendNormalisedWhitespace(_ accum: StringBuilder,
                                                   string: ArraySlice<UInt8>,
@@ -589,6 +772,26 @@ open class StringUtil {
             lastWasWhite: &lastWasWhite,
             sawWhitespace: &sawWhitespace
         )
+    }
+
+    @inline(__always)
+    static func appendNormalisedWhitespace(_ accum: StringBuilder,
+                                                  string: ByteSlice,
+                                                  stripLeading: Bool,
+                                                  lastWasWhite: inout Bool) {
+        var sawWhitespace = false
+        if string.isEmpty { return }
+        string.withUnsafeBytes { buf in
+            guard let basePtr = buf.baseAddress else { return }
+            appendNormalisedWhitespaceBytes(
+                accum,
+                basePtr: basePtr,
+                count: buf.count,
+                stripLeading: stripLeading,
+                lastWasWhite: &lastWasWhite,
+                sawWhitespace: &sawWhitespace
+            )
+        }
     }
 
     @inlinable
@@ -778,6 +981,210 @@ open class StringUtil {
         }
     }
 
+    @inline(__always)
+    static func appendNormalisedWhitespace(_ accum: StringBuilder,
+                                                  string: ByteSlice,
+                                                  stripLeading: Bool,
+                                                  lastWasWhite: inout Bool,
+                                                  sawWhitespace: inout Bool) {
+        if string.isEmpty { return }
+        string.withUnsafeBytes { buf in
+            guard let basePtr = buf.baseAddress else { return }
+            appendNormalisedWhitespaceBytes(
+                accum,
+                basePtr: basePtr,
+                count: buf.count,
+                stripLeading: stripLeading,
+                lastWasWhite: &lastWasWhite,
+                sawWhitespace: &sawWhitespace
+            )
+        }
+    }
+
+    @inline(__always)
+    private static func appendNormalisedWhitespaceBytes(_ accum: StringBuilder,
+                                                       basePtr: UnsafePointer<UInt8>,
+                                                       count: Int,
+                                                       stripLeading: Bool,
+                                                       lastWasWhite: inout Bool,
+                                                       sawWhitespace: inout Bool) {
+        if count <= 0 { return }
+        // Fast path for ASCII slices that only contain single spaces (no tabs/newlines/NBSP, no doubles).
+        var previousWasSpace = false
+        var sawSpace = false
+        var asciiOnlySingleSpace = true
+        var i = 0
+        while i < count {
+            let b = basePtr[i]
+            if b >= TokeniserStateVars.asciiUpperLimitByte {
+                asciiOnlySingleSpace = false
+                break
+            }
+            if b == TokeniserStateVars.spaceByte {
+                sawSpace = true
+                if previousWasSpace {
+                    asciiOnlySingleSpace = false
+                    break
+                }
+                previousWasSpace = true
+            } else if b == TokeniserStateVars.tabByte ||
+                        b == TokeniserStateVars.newLineByte ||
+                        b == TokeniserStateVars.formFeedByte ||
+                        b == TokeniserStateVars.carriageReturnByte {
+                asciiOnlySingleSpace = false
+                break
+            } else {
+                previousWasSpace = false
+            }
+            i &+= 1
+        }
+        if asciiOnlySingleSpace {
+            var start = 0
+            if (stripLeading || lastWasWhite) && basePtr[0] == TokeniserStateVars.spaceByte {
+                start = 1
+                if start >= count {
+                    return
+                }
+            }
+            accum.write(contentsOf: basePtr.advanced(by: start), count: count - start)
+            lastWasWhite = (basePtr[count - 1] == TokeniserStateVars.spaceByte)
+            if sawSpace {
+                sawWhitespace = true
+            }
+            return
+        }
+        var skipProbe = false
+        if count <= 64 {
+            var hasWhitespace = false
+            var asciiOnly = true
+            var j = 0
+            while j < count {
+                let b = basePtr[j]
+                if b >= TokeniserStateVars.asciiUpperLimitByte {
+                    asciiOnly = false
+                    break
+                }
+                if isAsciiWhitespaceByte(b) {
+                    hasWhitespace = true
+                    break
+                }
+                j &+= 1
+            }
+            if asciiOnly && !hasWhitespace {
+                accum.write(contentsOf: basePtr, count: count)
+                lastWasWhite = false
+                return
+            }
+            if asciiOnly && hasWhitespace {
+                skipProbe = true
+            }
+        }
+        #if canImport(Darwin) || canImport(Glibc)
+        if !skipProbe {
+            let hasWhitespace = memchr(basePtr, Int32(TokeniserStateVars.spaceByte), count) != nil ||
+                memchr(basePtr, Int32(TokeniserStateVars.tabByte), count) != nil ||
+                memchr(basePtr, Int32(TokeniserStateVars.newLineByte), count) != nil ||
+                memchr(basePtr, Int32(TokeniserStateVars.formFeedByte), count) != nil ||
+                memchr(basePtr, Int32(TokeniserStateVars.carriageReturnByte), count) != nil ||
+                memchr(basePtr, Int32(utf8NBSPTrail), count) != nil ||
+                memchr(basePtr, Int32(utf8NBSPLead), count) != nil
+            if !hasWhitespace {
+                accum.write(contentsOf: basePtr, count: count)
+                lastWasWhite = false
+                return
+            }
+        }
+        #else
+        var hasWhitespace = false
+        var k = 0
+        while k < count {
+            let b = basePtr[k]
+            if b == TokeniserStateVars.spaceByte ||
+                (b >= TokeniserStateVars.tabByte && b <= TokeniserStateVars.carriageReturnByte) {
+                hasWhitespace = true
+                break
+            }
+            k &+= 1
+        }
+        if !hasWhitespace {
+            accum.write(contentsOf: basePtr, count: count)
+            lastWasWhite = false
+            return
+        }
+        #endif
+
+        var reachedNonWhite = false
+        var idx = 0
+        while idx < count {
+            let firstByte = basePtr[idx]
+            if firstByte < TokeniserStateVars.asciiUpperLimitByte {
+                if isAsciiWhitespaceByte(firstByte) {
+                    if (stripLeading && !reachedNonWhite) || lastWasWhite {
+                        idx &+= 1
+                        continue
+                    }
+                    accum.append(TokeniserStateVars.spaceByte)
+                    lastWasWhite = true
+                    sawWhitespace = true
+                    idx &+= 1
+                    continue
+                }
+                var j = idx &+ 1
+                while j < count {
+                    let b = basePtr[j]
+                    if b >= TokeniserStateVars.asciiUpperLimitByte || isAsciiWhitespaceByte(b) {
+                        break
+                    }
+                    j &+= 1
+                }
+                accum.write(contentsOf: basePtr.advanced(by: idx), count: j - idx)
+                lastWasWhite = false
+                reachedNonWhite = true
+                idx = j
+                continue
+            }
+            if firstByte == utf8NBSPLead {
+                let next = idx &+ 1
+                if next < count, basePtr[next] == utf8NBSPTrail {
+                    if (stripLeading && !reachedNonWhite) || lastWasWhite {
+                        idx = next &+ 1
+                        continue
+                    }
+                    accum.append(TokeniserStateVars.spaceByte)
+                    lastWasWhite = true
+                    sawWhitespace = true
+                    idx = next &+ 1
+                    continue
+                }
+            }
+            let scalarByteCount: Int
+            if firstByte < utf8Lead3Min {
+                scalarByteCount = 2
+            } else if firstByte < utf8Lead4Min {
+                scalarByteCount = 3
+            } else {
+                scalarByteCount = 4
+            }
+            let next = idx &+ scalarByteCount
+            if next > count { return }
+            // Batch adjacent non-ASCII sequences that need no whitespace rewrite.
+            // Preserve the existing lead-byte stepping and truncated-tail behavior.
+            var runEnd = next
+            while runEnd < count {
+                let lead = basePtr[runEnd]
+                if lead < TokeniserStateVars.asciiUpperLimitByte { break }
+                if lead == utf8NBSPLead && runEnd + 1 < count && basePtr[runEnd + 1] == utf8NBSPTrail { break }
+                let width = lead < utf8Lead3Min ? 2 : (lead < utf8Lead4Min ? 3 : 4)
+                if width > count - runEnd { break }
+                runEnd += width
+            }
+            accum.write(contentsOf: basePtr.advanced(by: idx), count: runEnd - idx)
+            lastWasWhite = false
+            reachedNonWhite = true
+            idx = runEnd
+        }
+    }
+
 
 //    open static func inSorted(_ needle: String, haystack: [String]) -> Bool {
 //        return binarySearch(haystack, searchItem: needle) >= 0
@@ -836,10 +1243,11 @@ open class StringUtil {
                 return url.absoluteURL.absoluteString
             }
             
-            if base?.scheme != nil {
+            // Preserve empty references without letting a failed nonempty URL
+            // inherit the base URL's trusted scheme.
+            if relUrl.isEmpty {
                 return base!.absoluteString
             }
-            
             return empty
         }
     }

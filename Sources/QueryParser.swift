@@ -6,32 +6,20 @@
 //
 
 import Foundation
-#if canImport(Atomics)
-import Atomics
-#endif
 
 
 /**
  * Parses a CSS selector into an Evaluator tree.
  */
 public class QueryParser {
-    private static let combinators: [String]  = [",", ">", "+", "~", " "]
     private static let AttributeEvals: [String]  = ["=", "!=", "^=", "$=", "*=", "~="]
-    
-#if canImport(Atomics)
-    /// Atomic reference to the query parser cache. This allows for thread-safe manipulation of the
-    /// cache while avoiding locks.
-    private static let atomicCacheReference = ManagedAtomic<AtomicCacheWrapper?>(
-        AtomicCacheWrapper(cache: DefaultCache())
-    )
-#else
+
     /// Mutex lock for the cache instance.
     private static let cacheMutex = Mutex()
-    
+
     /// Cache instance. Must always access this with the ``QueryParser/cacheMutex``.
     nonisolated(unsafe)
     private static var cacheInstance: (any QueryParserCache)? = DefaultCache()
-#endif
     
     private var tq: TokenQueue
     private var query: String
@@ -59,6 +47,7 @@ public class QueryParser {
      - seealso: ``cache``
      */
     public static func parse(_ query: String)throws->Evaluator {
+        let query = TokenQueue.trimCssQuery(query)
         let cache = Self.cache
         if let cached = cache?.get(query) {
             return cached
@@ -75,21 +64,21 @@ public class QueryParser {
      - returns: ``Evaluator``
      */
     public func parse()throws->Evaluator {
-        tq.consumeWhitespace()
+        tq.consumeCssWhitespace()
 
-        if (tq.matchesAny(QueryParser.combinators)) { // if starts with a combinator, use root as elements
+        if let combinator = tq.consumeCssCombinator() { // if starts with a combinator, use root as elements
             evals.append( StructuralEvaluator.Root())
-            try combinator(tq.consume())
+            try self.combinator(combinator)
         } else {
             try findElements()
         }
 
         while (!tq.isEmpty()) {
             // hierarchy and extras
-            let seenWhite: Bool = tq.consumeWhitespace()
+            let seenWhite: Bool = tq.consumeCssWhitespace()
 
-            if (tq.matchesAny(QueryParser.combinators)) {
-                try combinator(tq.consume())
+            if let combinator = tq.consumeCssCombinator() {
+                try self.combinator(combinator)
             } else if (seenWhite) {
                 try combinator(" " as Character)
             } else { // E.class, E#id, E[attr] etc. AND
@@ -108,20 +97,6 @@ public class QueryParser {
     ///
     /// Defaults to ``DefaultCache``. You can set this to `nil` to disable caching, provide a
     /// ``DefaultCache`` instance with a different limit, or provide your own cache.
-#if canImport(Atomics)
-    public static var cache: (any QueryParserCache)? {
-        get {
-            Self.atomicCacheReference.load(ordering: .relaxed)?.wrapped
-        }
-        set {
-            if let newValue {
-                Self.atomicCacheReference.store(AtomicCacheWrapper(cache: newValue), ordering: .relaxed)
-            } else {
-                Self.atomicCacheReference.store(nil, ordering: .relaxed)
-            }
-        }
-    }
-#else
     public static var cache: (any QueryParserCache)? {
         get {
             Self.cacheMutex.lock()
@@ -134,13 +109,12 @@ public class QueryParser {
             Self.cacheInstance = newValue
         }
     }
-#endif
     
     
     // MARK: Private methods
 
     private func combinator(_ combinator: Character)throws {
-        tq.consumeWhitespace()
+        tq.consumeCssWhitespace()
         let subQuery: String = consumeSubQuery() // support multi > childs
 
         var rootEval: Evaluator? // the new topmost evaluator
@@ -187,30 +161,14 @@ public class QueryParser {
     }
 
     private func consumeSubQuery() -> String {
-        var sq = ""
-        while (!tq.isEmpty()) {
-            if (tq.matches("(")) {
-                sq.append("(")
-                sq.append(tq.chompBalanced("(", ")"))
-                sq.append(")")
-            } else if (tq.matches("[")) {
-                sq.append("[")
-                sq.append(tq.chompBalanced("[", "]"))
-                sq.append("]")
-            } else if (tq.matchesAny(QueryParser.combinators)) {
-                break
-            } else {
-                sq.append(tq.consume())
-            }
-        }
-        return sq
+        return tq.consumeCssSubQuery()
     }
 
     private func findElements() throws {
-        if (tq.matchChomp("#")) {
+        if (tq.matchChompCssIdentifierPrefix(0x23)) {
             try byId()
-        } else if (tq.matchChomp(".")) {
-            try byClass()} else if (tq.matchesWord() || tq.matches("*|")) {try byTag()} else if (tq.matches("[")) {try byAttribute()} else if (tq.matchChomp("*")) { allElements()} else if (tq.matchChomp(":lt(")) {try indexLessThan()} else if (tq.matchChomp(":gt(")) {try indexGreaterThan()} else if (tq.matchChomp(":eq(")) {try indexEquals()} else if (tq.matches(":has(")) {try has()} else if (tq.matches(":contains(")) {try contains(false)} else if (tq.matches(":containsOwn(")) {try contains(true)} else if (tq.matches(":matches(")) {try matches(false)} else if (tq.matches(":matchesOwn(")) {try matches(true)} else if (tq.matches(":not(")) {try not()} else if (tq.matchChomp(":nth-child(")) {try cssNthChild(false, false)} else if (tq.matchChomp(":nth-last-child(")) {try cssNthChild(true, false)} else if (tq.matchChomp(":nth-of-type(")) {try cssNthChild(false, true)} else if (tq.matchChomp(":nth-last-of-type(")) {try cssNthChild(true, true)} else if (tq.matchChomp(":first-child")) {evals.append(Evaluator.IsFirstChild())} else if (tq.matchChomp(":last-child")) {evals.append(Evaluator.IsLastChild())} else if (tq.matchChomp(":first-of-type")) {evals.append(Evaluator.IsFirstOfType())} else if (tq.matchChomp(":last-of-type")) {evals.append(Evaluator.IsLastOfType())} else if (tq.matchChomp(":only-child")) {evals.append(Evaluator.IsOnlyChild())} else if (tq.matchChomp(":only-of-type")) {evals.append(Evaluator.IsOnlyOfType())} else if (tq.matchChomp(":empty")) {evals.append(Evaluator.IsEmpty())} else if (tq.matchChomp(":root")) {evals.append(Evaluator.IsRoot())} else // unhandled
+        } else if (tq.matchChompCssIdentifierPrefix(0x2E)) {
+            try byClass()} else if (tq.matchesCssElementSelector()) {try byTag()} else if (tq.matches("[")) {try byAttribute()} else if (tq.matchChomp("*")) { allElements()} else if (tq.matchChomp(":lt(")) {try indexLessThan()} else if (tq.matchChomp(":gt(")) {try indexGreaterThan()} else if (tq.matchChomp(":eq(")) {try indexEquals()} else if (tq.matches(":has(")) {try has()} else if (tq.matches(":containsData(")) {try containsData()} else if (tq.matches(":contains(")) {try contains(false)} else if (tq.matches(":containsOwn(")) {try contains(true)} else if (tq.matches(":matches(")) {try matches(false)} else if (tq.matches(":matchesOwn(")) {try matches(true)} else if (tq.matches(":not(")) {try not()} else if (tq.matchChomp(":nth-child(")) {try cssNthChild(false, false)} else if (tq.matchChomp(":nth-last-child(")) {try cssNthChild(true, false)} else if (tq.matchChomp(":nth-of-type(")) {try cssNthChild(false, true)} else if (tq.matchChomp(":nth-last-of-type(")) {try cssNthChild(true, true)} else if (tq.matchChomp(":first-child")) {evals.append(Evaluator.IsFirstChild())} else if (tq.matchChomp(":last-child")) {evals.append(Evaluator.IsLastChild())} else if (tq.matchChomp(":first-of-type")) {evals.append(Evaluator.IsFirstOfType())} else if (tq.matchChomp(":last-of-type")) {evals.append(Evaluator.IsLastOfType())} else if (tq.matchChomp(":only-child")) {evals.append(Evaluator.IsOnlyChild())} else if (tq.matchChomp(":only-of-type")) {evals.append(Evaluator.IsOnlyOfType())} else if (tq.matchChomp(":empty")) {evals.append(Evaluator.IsEmpty())} else if (tq.matchChomp(":root")) {evals.append(Evaluator.IsRoot())} else // unhandled
         {
             throw Exception.Error(type: ExceptionType.SelectorParseException, Message: "Could not parse query \(query): unexpected token at \(tq.remainder())")
         }
@@ -225,33 +183,42 @@ public class QueryParser {
     private func byClass() throws {
         let className: String = tq.consumeCssIdentifier()
         try Validate.notEmpty(string: className)
-        evals.append(Evaluator.Class(className.trim()))
+        // Whitespace decoded from an escape is identifier content, not query padding.
+        evals.append(Evaluator.Class(className))
     }
 
     private func byTag() throws {
-        var tagName = tq.consumeElementSelector()
+        let wildcardNamespace = tq.matchChompCssIdentifierPrefix(0x2A) // *
+        if wildcardNamespace {
+            try Validate.isTrue(val: tq.matchChompCssIdentifierPrefix(0x7C),
+                                msg: "Missing namespace separator")
+        }
+        var tagName = tq.consumeCssIdentifier()
+
+        // Only unescaped pipes are namespace separators. Escaped pipes and
+        // colons belong to the decoded identifier itself.
+        while tq.matchChompCssIdentifierPrefix(0x7C) {
+            tagName += ":" + tq.consumeCssIdentifier()
+        }
 
         try Validate.notEmpty(string: tagName)
 
         // namespaces: wildcard match equals(tagName) or ending in ":"+tagName
-        if (tagName.startsWith("*|")) {
+        if wildcardNamespace {
+            // Keep these alternatives grouped: a top-level Or represents a
+            // comma-separated list when a later combinator is attached.
             evals.append(
-				CombiningEvaluator.Or(
-					Evaluator.Tag(tagName.trim().lowercased()),
-					Evaluator.TagEndsWith(tagName.replacingOccurrences(of: "*|", with: ":").trim().lowercased())))
+				CombiningEvaluator.And(CombiningEvaluator.Or(
+					Evaluator.Tag(tagName),
+					Evaluator.TagEndsWith(":" + tagName))))
         } else {
-            // namespaces: if element name is "abc:def", selector must be "abc|def", so flip:
-            if (tagName.contains("|")) {
-                tagName = tagName.replacingOccurrences(of: "|", with: ":")
-            }
-
-            evals.append(Evaluator.Tag(tagName.trim()))
+            evals.append(Evaluator.Tag(tagName))
         }
     }
 
     private func byAttribute() throws {
         let cq: TokenQueue = TokenQueue(tq.chompBalanced("[", "]")) // content queue
-        let key: String = cq.consumeToAny(QueryParser.AttributeEvals) // eq, not, start, end, contain, match, (no val)
+        let key: String = cq.consumeToAnySlice(QueryParser.AttributeEvals) // eq, not, start, end, contain, match, (no val)
         try Validate.notEmpty(string: key)
         cq.consumeWhitespace()
 
@@ -297,32 +264,42 @@ public class QueryParser {
         evals.append(Evaluator.IndexEquals(try consumeIndex()))
     }
 
-    //pseudo selectors :first-child, :last-child, :nth-child, ...
-    private static let NTH_AB: Pattern = Pattern.compile("((\\+|-)?(\\d+)?)n(\\s*(\\+|-)?\\s*\\d+)?", Pattern.CASE_INSENSITIVE)
-    private static let NTH_B: Pattern = Pattern.compile("(\\+|-)?(\\d+)")
+    // Parse the entire supported An+B spelling. CSS permits whitespace around
+    // the B separator, not inside the A coefficient or an integer's sign.
+    private static let NTH_AB = Pattern.compile(#"\A([+-]?[0-9]*)n(?:[\t\n\f\r ]*([+-])[\t\n\f\r ]*([0-9]+))?\z"#)
+    private static let NTH_B = Pattern.compile(#"\A[+-]?[0-9]+\z"#)
 
-    private func cssNthChild(_ backwards: Bool, _ ofType: Bool)throws {
-        let argS: String = tq.chompTo(")").trim().lowercased()
-        let mAB: Matcher = QueryParser.NTH_AB.matcher(in: argS)
-        let mB: Matcher = QueryParser.NTH_B.matcher(in: argS)
-        var a: Int
-        var b: Int
-        if ("odd"==argS) {
+    private func cssNthChild(_ backwards: Bool, _ ofType: Bool) throws {
+        let argS = try consumeNumericArgument().lowercased()
+        let a: Int
+        let b: Int
+        if argS == "odd" {
             a = 2
             b = 1
-        } else if ("even"==argS) {
+        } else if argS == "even" {
             a = 2
             b = 0
-        } else if (!mAB.matches.isEmpty) {
-			mAB.find()
-            a = mAB.group(3) != nil ? Int(mAB.group(1)!.replaceFirst(of: "^\\+", with: ""))! : 1
-            b = mAB.group(4) != nil ? Int(mAB.group(4)!.replaceFirst(of: "^\\+", with: ""))! : 0
-        } else if (!mB.matches.isEmpty) {
-            a = 0
-			mB.find()
-            b = Int(mB.group()!.replaceFirst(of: "^\\+", with: ""))!
         } else {
-            throw Exception.Error(type: ExceptionType.SelectorParseException, Message: "Could not parse nth-index '\(argS)': unexpected format")
+            let mAB = QueryParser.NTH_AB.matcher(in: argS)
+            if mAB.find(), let coefficient = mAB.group(1) {
+                switch coefficient {
+                case "", "+": a = 1
+                case "-": a = -1
+                default: a = try QueryParser.nthInteger(coefficient)
+                }
+                if let sign = mAB.group(2), let digits = mAB.group(3) {
+                    // Convert the signed spelling together so Int.min is valid.
+                    b = try QueryParser.nthInteger(sign + digits)
+                } else {
+                    b = 0
+                }
+            } else if QueryParser.NTH_B.matcher(in: argS).find() {
+                a = 0
+                b = try QueryParser.nthInteger(argS)
+            } else {
+                throw Exception.Error(type: .SelectorParseException,
+                                      Message: "Could not parse nth-index '\(argS)': unexpected format")
+            }
         }
         if (ofType) {
             if (backwards) {
@@ -339,10 +316,36 @@ public class QueryParser {
         }
     }
 
-    private func consumeIndex()throws->Int {
-        let indexS: String = tq.chompTo(")").trim()
-        try Validate.isTrue(val: StringUtil.isNumeric(indexS), msg: "Index must be numeric")
-        return Int(indexS)!
+    private static func nthInteger(_ spelling: String) throws -> Int {
+        guard let value = Int(spelling) else {
+            throw Exception.Error(type: .SelectorParseException,
+                                  Message: "Nth-index integer is outside the supported Int range")
+        }
+        return value
+    }
+
+    private func consumeNumericArgument() throws -> String {
+        // Do not call the general substring search at end-of-input: it assumes
+        // there is at least one remaining character for its search range.
+        guard !tq.isEmpty() else {
+            throw Exception.Error(type: .SelectorParseException, Message: "Unclosed numeric selector")
+        }
+        let argument = TokenQueue.trimCssQuery(tq.consumeTo(")"))
+        guard tq.matchChomp(")") else {
+            throw Exception.Error(type: .SelectorParseException, Message: "Unclosed numeric selector")
+        }
+        return argument
+    }
+
+    private func consumeIndex() throws -> Int {
+        let indexS = try consumeNumericArgument()
+        guard !indexS.isEmpty,
+              indexS.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }),
+              let index = Int(indexS) else {
+            throw Exception.Error(type: .SelectorParseException,
+                                  Message: "Index must be an unsigned decimal within the supported Int range")
+        }
+        return index
     }
 
     // pseudo selector :has(el)
@@ -350,7 +353,14 @@ public class QueryParser {
         try tq.consume(":has")
         let subQuery: String = tq.chompBalanced("(", ")")
         try Validate.notEmpty(string: subQuery, msg: ":has(el) subselect must not be empty")
-        evals.append(StructuralEvaluator.Has(try QueryParser.parse(subQuery)))
+        let branches = try TokenQueue(subQuery).consumeCssSelectorList().map { branch -> Evaluator in
+            let query = TokenQueue.trimCssQuery(branch)
+            try Validate.notEmpty(string: query, msg: ":has selector-list branch must not be empty")
+            let leadingByte = query.utf8.first
+            let followsSiblings = leadingByte == 0x2B || leadingByte == 0x7E // + or ~
+            return StructuralEvaluator.Has(try QueryParser.parse(query), followingSiblings: followsSiblings)
+        }
+        evals.append(branches.count == 1 ? branches[0] : CombiningEvaluator.Or(branches))
     }
 
     // pseudo selector :contains(text), containsOwn(text)
@@ -363,6 +373,14 @@ public class QueryParser {
         } else {
             evals.append(Evaluator.ContainsText(searchText))
         }
+    }
+
+    // pseudo selector :containsData(data)
+    private func containsData() throws {
+        try tq.consume(":containsData")
+        let searchText: String = TokenQueue.unescape(tq.chompBalanced("(", ")"))
+        try Validate.notEmpty(string: searchText, msg: ":containsData(text) query must not be empty")
+        evals.append(Evaluator.ContainsData(searchText))
     }
 
     // :matches(regex), matchesOwn(regex)

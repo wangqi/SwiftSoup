@@ -79,6 +79,60 @@ print(try document.title()) // Output: Example
 ```
 
 ---
+### Automatic Format Detection
+
+`SwiftSoup.parse(...)` automatically detects XML input by looking for an `<?xml` declaration at the start of the
+content. When detected, the XML parser is used; otherwise the HTML parser is applied. This means feeds, OPML, and
+other XML documents with a standard XML declaration "just work":
+
+```swift
+import SwiftSoup
+
+let xml = """
+<?xml version="1.0" encoding="UTF-8"?>
+<opml version="1.0">
+  <body>
+    <link>I'm link</link>
+    <img>I'm img</img>
+  </body>
+</opml>
+"""
+
+let document = try SwiftSoup.parse(xml) // auto-detects XML
+print(try document.select("link").first()?.text()) // Output: I'm link
+print(try document.select("body > img").first()?.text()) // Output: I'm img
+```
+
+### Explicit Parse Modes
+
+Use `parseXML(...)` or `parseHTML(...)` when you want to force a specific parser regardless of the content:
+
+```swift
+// Force XML parsing (no HTML5 tag normalization)
+let xmlDoc = try SwiftSoup.parseXML(xmlString)
+
+// Force HTML parsing (always applies HTML5 rules, even if input has <?xml>)
+let htmlDoc = try SwiftSoup.parseHTML(htmlString)
+
+// Explicit parser argument (unchanged from before)
+let doc = try SwiftSoup.parse(input, baseUri, Parser.xmlParser())
+```
+
+---
+### Parse HTML from a URL
+
+If Foundation cannot determine a page's text encoding, avoid `String(contentsOf:)` and parse the raw response bytes
+instead:
+
+```swift
+import SwiftSoup
+
+let url = URL(string: "https://example.com")!
+let document = try SwiftSoup.parse(url)
+print(try document.title())
+```
+
+---
 ## Profiling
 
 SwiftSoup includes a lightweight profiler (gated by a compile-time flag) and a small CLI harness for parsing benchmarks.
@@ -162,6 +216,16 @@ let cleanHtml = try SwiftSoup.clean(dirtyHtml, Whitelist.basic())
 print(cleanHtml) // Output: <b>Important text</b>
 ```
 
+```swift
+let dirtyHtml = #"<p style="color:red; position:absolute">Styled text</p>"#
+let whitelist = try Whitelist()
+    .addTags("p")
+    .addAttributes("p", "style")
+    .addCSSProperties("p", "color")
+let cleanHtml = try SwiftSoup.clean(dirtyHtml, whitelist)
+print(cleanHtml) // Output: <p style="color:red">Styled text</p>
+```
+
 ---
 ### Use CSS selectors to find elements
 (from [jsoup](https://jsoup.org/cookbook/extracting-data/selector-syntax))
@@ -180,7 +244,7 @@ print(cleanHtml) // Output: <b>Important text</b>
 - `[*]` selects elements that have any attribute. e.g. `p[*]` finds paragraphs with at least one attribute, and `p:not([*])` finds those with no attributes.
 - `ns|tag`: find elements by tag in a namespace prefix, e.g. `dc|name` finds `<dc:name>` elements
 - `*|tag`: find elements by tag in any namespace prefix, e.g. `*|name` finds `<dc:name>` and `<name>` elements
-- `:empty`: selects elements that have no children (ignoring blank text nodes, comments, etc.); e.g. `li:empty`
+- `:empty`: selects elements that have no children (ignoring zero-length text nodes, comments, etc.; whitespace-only text still counts as content); e.g. `li:empty`
 
 #### Selector combinations
 

@@ -55,7 +55,7 @@ public class TreeBuilder {
         doc = Document(baseUri)
         tracksSourceRanges = settings.tracksSourceRanges()
         if tracksSourceRanges {
-            doc.sourceBuffer = SourceBuffer(input)
+            doc.sourceBuffer = SourceBuffer(input, parsedAsXml: self is XmlTreeBuilder)
         } else {
             doc.sourceBuffer = nil
         }
@@ -70,7 +70,32 @@ public class TreeBuilder {
         reader = CharacterReader(parseBuffer)
         self.errors = errors
         tracksErrors = errors.getMaxSize() > 0
-        tokeniser = Tokeniser(reader, tracksErrors ? errors : nil, settings)
+        tokeniser = Tokeniser(reader, tracksErrors ? errors : nil, settings,
+                              isXmlParser: self is XmlTreeBuilder,
+                              normalizesHtmlNumericReferences: !(self is XmlTreeBuilder))
+        stack = Array<Element>()
+        self.baseUri = baseUri
+        pendingAttributeElements.removeAll(keepingCapacity: true)
+    }
+
+    public func initialiseParse(_ input: UnsafeBufferPointer<UInt8>, owner: AnyObject?, _ baseUri: [UInt8], _ errors: ParseErrorList, _ settings: ParseSettings) {
+        doc = Document(baseUri)
+        tracksSourceRanges = settings.tracksSourceRanges()
+        if tracksSourceRanges {
+            let copied = Array(input)
+            doc.sourceBuffer = SourceBuffer(copied, parsedAsXml: self is XmlTreeBuilder)
+            reader = CharacterReader(copied)
+        } else {
+            doc.sourceBuffer = nil
+            reader = CharacterReader(input, owner: owner)
+        }
+        doc.parsedAsXml = false
+        self.settings = settings
+        self.errors = errors
+        tracksErrors = errors.getMaxSize() > 0
+        tokeniser = Tokeniser(reader, tracksErrors ? errors : nil, settings,
+                              isXmlParser: self is XmlTreeBuilder,
+                              normalizesHtmlNumericReferences: !(self is XmlTreeBuilder))
         stack = Array<Element>()
         self.baseUri = baseUri
         pendingAttributeElements.removeAll(keepingCapacity: true)
@@ -96,6 +121,24 @@ public class TreeBuilder {
         }
         return doc
     }
+
+    func parse(_ input: UnsafeBufferPointer<UInt8>, owner: AnyObject?, _ baseUri: [UInt8],
+               _ errors: ParseErrorList,
+               _ settings: ParseSettings) throws -> Document {
+        doc.treeBuilder = self
+        beginBulkAppend()
+        defer { endBulkAppend() }
+
+        initialiseParse(input, owner: owner, baseUri, errors, settings)
+        try runParser()
+        if !tracksSourceRanges, !pendingAttributeElements.isEmpty {
+            for element in pendingAttributeElements {
+                element.attributes?.ensureMaterialized()
+            }
+            pendingAttributeElements.removeAll(keepingCapacity: true)
+        }
+        return doc
+    }
     
     @inline(__always)
     func registerPendingAttributes(_ element: Element) {
@@ -107,10 +150,6 @@ public class TreeBuilder {
     }
     
     public func runParser() throws {
-        #if PROFILE
-        let _p = Profiler.start("TreeBuilder.runParser")
-        defer { Profiler.end("TreeBuilder.runParser", _p) }
-        #endif
         while (true) {
             let token: Token = try tokeniser.read()
             try process(token)
@@ -119,7 +158,7 @@ public class TreeBuilder {
             }
         }
     }
-    
+
     @discardableResult
     @inline(__always)
     public func process(_ token: Token)throws->Bool {preconditionFailure("This method must be overridden")}

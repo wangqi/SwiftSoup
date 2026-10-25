@@ -12,7 +12,7 @@ import Foundation
  */
 class HtmlTreeBuilder: TreeBuilder {
     enum PendingTableCharacter {
-        case slice(ArraySlice<UInt8>)
+        case slice(ByteSlice)
         case bytes([UInt8])
     }
 
@@ -58,6 +58,13 @@ class HtmlTreeBuilder: TreeBuilder {
     private var _framesetOk: Bool = true // if ok to go into frameset
     private var fosterInserts: Bool = false // if next inserts should be fostered
     private var fragmentParsing: Bool = false // if parsing a fragment of html
+    // Only true inside the private fragment parse loop, not manual token processing.
+    private var constructingFragment: Bool = false
+
+    private var stackTrackingDirty: Bool = false
+    private var stackUnknownTagIdCount: Int = 0
+    private var stackTagIdP: [Int] = []
+    private var stackTagIdButton: [Int] = []
 
     
     public override init() {
@@ -69,13 +76,35 @@ class HtmlTreeBuilder: TreeBuilder {
     }
 
     
-    override func parse(_ input: [UInt8], _ baseUri: [UInt8], _ errors: ParseErrorList, _ settings: ParseSettings) throws -> Document {
-        _state = HtmlTreeBuilderState.Initial
+    private func resetParseState() {
+        _state = .Initial
+        _originalState = .Initial
         baseUriSetFromDoc = false
-        return try super.parse(input, baseUri, errors, settings)
+        headElement = nil
+        formElement = nil
+        contextElement = nil
+        formattingElements.removeAll(keepingCapacity: true)
+        pendingTableCharacters.removeAll(keepingCapacity: true)
+        emptyEnd.reset()
+        _framesetOk = true
+        fosterInserts = false
+        fragmentParsing = false
+        constructingFragment = false
+        currentToken = nil
     }
 
-    
+    override func initialiseParse(_ input: [UInt8], _ baseUri: [UInt8], _ errors: ParseErrorList, _ settings: ParseSettings) {
+        resetParseState()
+        super.initialiseParse(input, baseUri, errors, settings)
+        resetStackTracking()
+    }
+
+    override func initialiseParse(_ input: UnsafeBufferPointer<UInt8>, owner: AnyObject?, _ baseUri: [UInt8], _ errors: ParseErrorList, _ settings: ParseSettings) {
+        resetParseState()
+        super.initialiseParse(input, owner: owner, baseUri, errors, settings)
+        resetStackTracking()
+    }
+
     func parseFragment(_ inputFragment: [UInt8], _ context: Element?, _ baseUri: [UInt8], _ errors: ParseErrorList, _ settings: ParseSettings) throws -> Array<Node> {
         // context may be null
         _state = HtmlTreeBuilderState.Initial
@@ -90,16 +119,19 @@ class HtmlTreeBuilder: TreeBuilder {
             }
             
             // initialise the tokeniser state:
-            if TagSets.titleTextarea.contains(context.tagNameUTF8()) || TagSets.frames.contains(context.tagNameUTF8()) {
+            let contextTagName = context.tagNameNormalUTF8()
+            if TagSets.titleTextarea.contains(contextTagName) {
                 tokeniser.transition(TokeniserState.Rcdata)
+            } else if TagSets.frames.contains(contextTagName) {
+                tokeniser.transition(TokeniserState.Rawtext)
             } else {
-                switch context.tagNameUTF8() {
+                switch contextTagName {
                 case UTF8Arrays.script:
                     tokeniser.transition(TokeniserState.ScriptData)
                 case UTF8Arrays.noscript:
                     tokeniser.transition(TokeniserState.Data) // if scripting enabled, rawtext
                 case UTF8Arrays.plaintext:
-                    tokeniser.transition(TokeniserState.Data)
+                    tokeniser.transition(TokeniserState.PLAINTEXT)
                 default:
                     tokeniser.transition(TokeniserState.Data)
                 }
@@ -109,7 +141,7 @@ class HtmlTreeBuilder: TreeBuilder {
             root?.treeBuilder = self
             try Validate.notNull(obj: root)
             try doc.appendChild(root!)
-            stack.append(root!)
+            push(root!)
             resetInsertionMode()
             
             // setup form element to nearest form on context (up ancestor chain). ensures form controls are associated
@@ -124,6 +156,8 @@ class HtmlTreeBuilder: TreeBuilder {
             }
         }
         
+        constructingFragment = true
+        defer { constructingFragment = false }
         try runParser()
         if (context != nil && root != nil) {
             return root!.getChildNodes()
@@ -135,10 +169,6 @@ class HtmlTreeBuilder: TreeBuilder {
     
     @discardableResult
     public override func process(_ token: Token)throws->Bool {
-        #if PROFILE
-        let _p = Profiler.start("HtmlTreeBuilder.process")
-        defer { Profiler.end("HtmlTreeBuilder.process", _p) }
-        #endif
         if !tracksErrors, !tracksSourceRanges, _state == .InBody {
             switch token.type {
             case .Char:
@@ -178,10 +208,6 @@ class HtmlTreeBuilder: TreeBuilder {
     
     @discardableResult
     func process(_ token: Token, _ state: HtmlTreeBuilderState)throws->Bool {
-        #if PROFILE
-        let _p = Profiler.start("HtmlTreeBuilder.process.state")
-        defer { Profiler.end("HtmlTreeBuilder.process.state", _p) }
-        #endif
         if !tracksErrors && !tracksSourceRanges {
             return try state.process(token, self)
         }
@@ -200,7 +226,17 @@ class HtmlTreeBuilder: TreeBuilder {
 
     @inline(__always)
     func markStructuralChange(_ node: Node? = nil) {
-        (node ?? currentElement())?.markSourceDirty(force: true)
+        guard let node = node ?? currentElement() else { return }
+        if (isBulkBuilding || constructingFragment), doc.sourceRangeDirty,
+           doc.dirtySourceRoots[ObjectIdentifier(doc)]?.value === doc {
+            // Only parser-owned construction can use the known document. Public
+            // TreeBuilder stack edits outside parsing must retain owner dispatch.
+            // The current parser tree is already covered. A newly synthesized
+            // detached element also has no document registration to perform.
+            node.markSourceDirty(force: true, registerDirtyRoot: false)
+        } else {
+            node.markSourceDirty(force: true)
+        }
     }
     
     func state() -> HtmlTreeBuilderState {
@@ -259,16 +295,12 @@ class HtmlTreeBuilder: TreeBuilder {
     @inlinable
     @discardableResult
     func insert(_ startTag: Token.StartTag) throws -> Element {
-        #if PROFILE
-        let _p = Profiler.start("HtmlTreeBuilder.insert.startTag")
-        defer { Profiler.end("HtmlTreeBuilder.insert.startTag", _p) }
-        #endif
         // handle empty unknown tags
         // when the spec expects an empty tag, will directly hit insertEmpty, so won't generate this fake end tag.
         let isSelfClosing = startTag.isSelfClosing()
         if isSelfClosing {
             let el: Element = try insertEmpty(startTag)
-            stack.append(el)
+            push(el)
             tokeniser.transition(TokeniserState.Data) // handles <script />, otherwise needs breakout steps from script data
             try tokeniser.emit(emptyEnd.reset().name(el.tagNameUTF8()))  // ensure we get out of whatever state we are in. emitted for yielded processing
             return el
@@ -327,12 +359,8 @@ class HtmlTreeBuilder: TreeBuilder {
     
     @inlinable
     func insert(_ el: Element) throws {
-        #if PROFILE
-        let _p = Profiler.start("HtmlTreeBuilder.insert.element")
-        defer { Profiler.end("HtmlTreeBuilder.insert.element", _p) }
-        #endif
         try insertNode(el)
-        stack.append(el)
+        push(el)
     }
     
     @discardableResult
@@ -403,14 +431,14 @@ class HtmlTreeBuilder: TreeBuilder {
         registerPendingAttributes(el)
         try insertNode(el)
         if (onStack) {
-            stack.append(el)
+            push(el)
         }
         return el
     }
 
     
     func insert(_ commentToken: Token.Comment) throws {
-        let comment: Comment = Comment(commentToken.getData(), baseUri)
+        let comment: Comment = Comment(slice: commentToken.takeDataSlice(), baseUri)
         if let range = commentToken.sourceRange {
             comment.setSourceRange(range, complete: true)
         }
@@ -419,10 +447,6 @@ class HtmlTreeBuilder: TreeBuilder {
     
     @inlinable
     func insert(_ characterToken: Token.Char) throws {
-        #if PROFILE
-        let _p = Profiler.start("HtmlTreeBuilder.insert.char")
-        defer { Profiler.end("HtmlTreeBuilder.insert.char", _p) }
-        #endif
         let current = currentElement()
         let currentTag = current?._tag
         let currentTagId = currentTag?.tagId ?? .none
@@ -451,16 +475,16 @@ class HtmlTreeBuilder: TreeBuilder {
             return lastRange.end == newRange.start
         }
         let node: Node
-        var useSlice: ArraySlice<UInt8>?
+        var useSlice: ByteSlice?
         if !tracksSourceRanges {
             useSlice = characterToken.getDataSlice()
         } else if let tokenSlice = characterToken.getDataSlice() {
             useSlice = tokenSlice
         } else if let range = characterToken.sourceRange,
-                  let source = doc.sourceBuffer?.bytes,
+                  let source = doc.sourceBuffer,
                   range.isValid,
-                  range.end <= source.count {
-            useSlice = source[range.start..<range.end]
+                  range.end <= source.bytes.count {
+            useSlice = ByteSlice(storage: source.storage, start: range.start, end: range.end)
         } else {
             useSlice = nil
         }
@@ -477,7 +501,7 @@ class HtmlTreeBuilder: TreeBuilder {
                    (!tracksSourceRanges || canCoalesceSource(lastData.sourceRange, characterToken.sourceRange)) {
                     if tracksSourceRanges,
                        let range = characterToken.sourceRange,
-                       let source = doc.sourceBuffer?.bytes,
+                       let source = doc.sourceBuffer,
                        lastData.extendSliceFromSourceRange(source, newRange: range) {
                         lastData.setSourceRangeEnd(range.end)
                         return
@@ -493,7 +517,7 @@ class HtmlTreeBuilder: TreeBuilder {
                    (!tracksSourceRanges || canCoalesceSource(lastText.sourceRange, characterToken.sourceRange)) {
                     if tracksSourceRanges,
                        let range = characterToken.sourceRange,
-                       let source = doc.sourceBuffer?.bytes,
+                       let source = doc.sourceBuffer,
                        lastText.extendSliceFromSourceRange(source, newRange: range) {
                         lastText.setSourceRangeEnd(range.end)
                         return
@@ -555,6 +579,8 @@ class HtmlTreeBuilder: TreeBuilder {
             current.childNodes.append(node)
             node.parentNode = current
             node.setSiblingIndex(current.childNodes.count - 1)
+        } else if fragmentParsing, !fosterInserts, let current, node.parentNode == nil {
+            appendFragmentNode(node, to: current)
         } else {
             try current?.appendChild(node) // doesn't use insertNode, because we don't foster these; and will always have a stack.
         }
@@ -563,10 +589,6 @@ class HtmlTreeBuilder: TreeBuilder {
     
     @inlinable
     internal func insertNode(_ node: Node) throws {
-        #if PROFILE
-        let _p = Profiler.start("HtmlTreeBuilder.insert.node")
-        defer { Profiler.end("HtmlTreeBuilder.insert.node", _p) }
-        #endif
         node.treeBuilder = self
         // if the stack hasn't been set up yet, elements (doctype, comments) go into the doc
         if stack.isEmpty {
@@ -578,6 +600,8 @@ class HtmlTreeBuilder: TreeBuilder {
                 node.parentNode = current
                 current.childNodes.append(node)
                 node.setSiblingIndex(current.childNodes.count - 1)
+            } else if fragmentParsing, node.parentNode == nil {
+                appendFragmentNode(node, to: current)
             } else {
                 try current.appendChild(node)
             }
@@ -592,9 +616,47 @@ class HtmlTreeBuilder: TreeBuilder {
         }
     }
     
+    /// Appends a newly created fragment node to this parser's private tree.
+    /// Keep fragment mutation/range bookkeeping, but reuse its known document.
+    @usableFromInline
+    internal func appendFragmentNode(_ node: Node, to parent: Element) {
+        if constructingFragment, let element = node as? Element {
+            // Mark the new detached element, but do not walk its private
+            // ancestors again: each has already been dirtied on insertion.
+            // No query indexes are built during the fragment parser loop.
+            element.markQueryIndexesDirty()
+            let suppressed = element.suppressQueryIndexDirty
+            element.suppressQueryIndexDirty = true
+            node.parentNode = parent
+            element.suppressQueryIndexDirty = suppressed
+        } else {
+            node.parentNode = parent
+        }
+        node.treeBuilder = parent.treeBuilder
+        parent.childNodes.append(node)
+        node.setSiblingIndex(parent.childNodes.count - 1)
+        if constructingFragment, doc.sourceRangeDirty,
+           doc.dirtySourceRoots[ObjectIdentifier(doc)]?.value === doc {
+            // The registered document already covers this private fragment tree.
+            // These are parse-time marks: stop at dirty ancestors instead of
+            // walking the entire fragment depth for every inserted node.
+            node.markSourceDirty(force: true, registerDirtyRoot: false)
+            parent.markSourceDirty(force: true, registerDirtyRoot: false)
+        } else {
+            node.markSourceDirty()
+            parent.markSourceDirty()
+        }
+        // After fragment construction, manual token processing must obey the
+        // same text-predicate invalidation contract as public appendChild.
+        if !constructingFragment && parent.treeBuilder?.isBulkBuilding != true {
+            parent.bumpTextMutationVersion()
+        }
+    }
+
     @discardableResult
     func pop() -> Element {
         let element = stack.removeLast()
+        updateStackTrackingOnPop(element)
         if tracksSourceRanges,
            let endTag = currentToken as? Token.EndTag,
            let endRange = endTag.sourceRange,
@@ -608,6 +670,67 @@ class HtmlTreeBuilder: TreeBuilder {
     @inlinable
     func push(_ element: Element) {
         stack.append(element)
+        updateStackTrackingOnPush(element)
+    }
+
+    @inline(__always)
+    private func resetStackTracking() {
+        stackTrackingDirty = false
+        stackUnknownTagIdCount = 0
+        stackTagIdP.removeAll(keepingCapacity: true)
+        stackTagIdButton.removeAll(keepingCapacity: true)
+        if stack.isEmpty {
+            return
+        }
+        for (index, element) in stack.enumerated() {
+            updateStackTrackingOnPush(element, index: index, allowDirty: false)
+        }
+    }
+
+    @inline(__always)
+    private func rebuildStackTrackingIfNeeded() {
+        if stackTrackingDirty {
+            resetStackTracking()
+        }
+    }
+
+    @inline(__always)
+    private func updateStackTrackingOnPush(_ element: Element) {
+        updateStackTrackingOnPush(element, index: stack.count - 1, allowDirty: true)
+    }
+
+    @inline(__always)
+    private func updateStackTrackingOnPush(_ element: Element, index: Int, allowDirty: Bool) {
+        if allowDirty && stackTrackingDirty {
+            return
+        }
+        let tagId = element._tag.tagId
+        if tagId == .none {
+            stackUnknownTagIdCount &+= 1
+            return
+        }
+        if tagId == .p {
+            stackTagIdP.append(index)
+        } else if tagId == .button {
+            stackTagIdButton.append(index)
+        }
+    }
+
+    @inline(__always)
+    private func updateStackTrackingOnPop(_ element: Element) {
+        if stackTrackingDirty {
+            return
+        }
+        let tagId = element._tag.tagId
+        if tagId == .none {
+            stackUnknownTagIdCount &-= 1
+            return
+        }
+        if tagId == .p {
+            _ = stackTagIdP.popLast()
+        } else if tagId == .button {
+            _ = stackTagIdButton.popLast()
+        }
     }
     
     @inlinable
@@ -617,7 +740,7 @@ class HtmlTreeBuilder: TreeBuilder {
     
     @discardableResult
     func onStack(_ el: Element) -> Bool {
-        return isElementInQueue(stack, el)
+        return lastIndexOfStackElement(el) != nil
     }
     
     private func isElementInQueue(_ queue: Array<Element?>, _ element: Element?) -> Bool {
@@ -706,6 +829,22 @@ class HtmlTreeBuilder: TreeBuilder {
         return stack[index]
     }
 
+    /// Records the explicit closing tag for an element that remains on the HTML
+    /// parser stack. `body` and `html` transition the insertion mode without
+    /// being popped, so the normal pop bookkeeping cannot complete their ranges.
+    @inline(__always)
+    func completeSourceRangeForOpenElement(
+        _ elementName: [UInt8],
+        endingAt endTag: Token.EndTag
+    ) {
+        guard tracksSourceRanges,
+              let endRange = endTag.sourceRange,
+              let element = getFromStack(elementName) else {
+            return
+        }
+        element.setSourceRangeEnd(endRange.end)
+    }
+
     
     @inlinable
     func getFromStack(_ elName: String) -> Element? {
@@ -716,6 +855,7 @@ class HtmlTreeBuilder: TreeBuilder {
     func removeFromStack(_ el: Element) -> Bool {
         if let index = lastIndexOfStackElement(el) {
             stack.remove(at: index)
+            stackTrackingDirty = true
             return true
         }
         return false
@@ -731,6 +871,7 @@ class HtmlTreeBuilder: TreeBuilder {
                 stack[index].setSourceRangeEnd(endRange.end)
             }
             stack.removeSubrange(index..<stack.count)
+            stackTrackingDirty = true
         }
     }
 
@@ -738,6 +879,7 @@ class HtmlTreeBuilder: TreeBuilder {
     func popStackToClose(_ elName: ParsingStrings) {
         if let index = lastIndexOfStackName(in: elName) {
             stack.removeSubrange(index..<stack.count)
+            stackTrackingDirty = true
         }
     }
     
@@ -748,12 +890,14 @@ class HtmlTreeBuilder: TreeBuilder {
     func popStackToClose(_ elNames: [[UInt8]]) {
         if let index = lastIndexOfStackName(in: elNames) {
             stack.removeSubrange(index..<stack.count)
+            stackTrackingDirty = true
         }
     }
     
     func popStackToClose(_ elNames: Set<[UInt8]>) {
         if let index = lastIndexOfStackName(in: elNames) {
             stack.removeSubrange(index..<stack.count)
+            stackTrackingDirty = true
         }
     }
     
@@ -764,6 +908,7 @@ class HtmlTreeBuilder: TreeBuilder {
                 break
             } else {
                 stack.remove(at: pos)
+                stackTrackingDirty = true
             }
         }
     }
@@ -800,10 +945,12 @@ class HtmlTreeBuilder: TreeBuilder {
         
         guard let index else {
             stack.removeAll()
+            stackTrackingDirty = true
             return
         }
         
         stack.removeSubrange(stack.index(after: index) ..< stack.endIndex)
+        stackTrackingDirty = true
     }
     
     private func clearStackToContext(_ nodeNames: [UInt8]...) {
@@ -825,10 +972,12 @@ class HtmlTreeBuilder: TreeBuilder {
         
         guard let index else {
             stack.removeAll()
+            stackTrackingDirty = true
             return
         }
         
         stack.removeSubrange(stack.index(after: index) ..< stack.endIndex)
+        stackTrackingDirty = true
     }
     
     func aboveOnStack(_ el: Element) -> Element? {
@@ -854,10 +1003,12 @@ class HtmlTreeBuilder: TreeBuilder {
         }
         
         stack.insert(input, at: stack.index(after: index))
+        stackTrackingDirty = true
     }
     
     func replaceOnStack(_ out: Element, _ input: Element)throws {
         try stack = replaceInQueue(stack, out, input)
+        stackTrackingDirty = true
     }
     
     private func replaceInQueue(_ queue: Array<Element>, _ out: Element, _ input: Element)throws->Array<Element> {
@@ -1061,12 +1212,30 @@ class HtmlTreeBuilder: TreeBuilder {
 
     
     func inButtonScope(_ targetName: [UInt8]) throws -> Bool {
+        if targetName == UTF8Arrays.p {
+            return try inButtonScopePFast()
+        }
         return try inScope(targetName, TagSets.button)
     }
 
     
     func inButtonScope(_ targetName: String) throws -> Bool {
         return try inButtonScope(targetName.utf8Array)
+    }
+
+    @inline(__always)
+    private func inButtonScopePFast() throws -> Bool {
+        rebuildStackTrackingIfNeeded()
+        if stackUnknownTagIdCount == 0 {
+            guard let lastP = stackTagIdP.last else {
+                return false
+            }
+            if let lastButton = stackTagIdButton.last {
+                return lastP > lastButton
+            }
+            return true
+        }
+        return try inScope(UTF8Arrays.p, TagSets.button)
     }
     
     func inTableScope(_ targetName: [UInt8]) throws -> Bool {

@@ -9,6 +9,10 @@ open class StringBuilder {
     
     /// Number of bytes currently used in buffer
     private var size: Int = 0
+    private static let poolLock = Mutex()
+    @usableFromInline
+    nonisolated(unsafe) static var pool: [StringBuilder] = []
+    private static let poolLimit: Int = 16
     @usableFromInline
     static let useFastWrite: Bool = true
     @usableFromInline
@@ -33,6 +37,14 @@ open class StringBuilder {
     public var buffer: ArraySlice<UInt8> {
         return internalBuffer[0..<size]
     }
+
+    @usableFromInline
+    @inline(__always)
+    func asByteSlice() -> ByteSlice {
+        if size == 0 { return ByteSlice.empty }
+        let storage = ByteStorage(array: internalBuffer)
+        return ByteSlice(storage: storage, start: 0, end: size)
+    }
     
     /**
      Construct with initial String contents
@@ -52,6 +64,37 @@ open class StringBuilder {
     public init(_ capacity: Int) {
         internalBuffer = []
         internalBuffer.reserveCapacity(capacity)
+    }
+
+    @usableFromInline
+    @inline(__always)
+    static func acquire(_ capacity: Int = 0) -> StringBuilder {
+        poolLock.lock()
+        if let builder = pool.popLast() {
+            poolLock.unlock()
+            builder.clear()
+            if capacity > builder.internalBuffer.capacity {
+                builder.internalBuffer.reserveCapacity(capacity)
+            }
+            return builder
+        }
+        poolLock.unlock()
+        return StringBuilder(capacity)
+    }
+
+    @usableFromInline
+    @inline(__always)
+    static func release(_ builder: StringBuilder) {
+        builder.clear()
+        if builder.internalBuffer.capacity > 1_048_576 {
+            builder.internalBuffer = []
+            builder.internalBuffer.reserveCapacity(1024)
+        }
+        poolLock.lock()
+        if pool.count < poolLimit {
+            pool.append(builder)
+        }
+        poolLock.unlock()
     }
     
     /**
@@ -108,6 +151,11 @@ open class StringBuilder {
     open func append(_ chr: Character) {
         append(String(chr))
     }
+
+    @inline(__always)
+    open func appendNewline() {
+        write(TokeniserStateVars.newLineByte)
+    }
     
     @inline(__always)
     open func appendCodePoints(_ chr: [Character]) {
@@ -117,6 +165,37 @@ open class StringBuilder {
     @inline(__always)
     open func appendCodePoint(_ ch: Int) {
         appendCodePoint(UnicodeScalar(ch)!)
+    }
+
+    @inline(__always)
+    open func appendSpaces(_ count: Int) {
+        if count <= 0 { return }
+        let newSize = size + count
+        if internalBuffer.count < newSize {
+            internalBuffer.reserveCapacity(newSize)
+        }
+        if newSize <= internalBuffer.count {
+            internalBuffer.withUnsafeMutableBufferPointer { dst in
+                guard let base = dst.baseAddress else { return }
+                base.advanced(by: size).initialize(repeating: TokeniserStateVars.spaceByte, count: count)
+            }
+            size = newSize
+            return
+        }
+        if size < internalBuffer.count {
+            let fillCount = internalBuffer.count - size
+            if fillCount > 0 {
+                internalBuffer.withUnsafeMutableBufferPointer { dst in
+                    guard let base = dst.baseAddress else { return }
+                    base.advanced(by: size).initialize(repeating: TokeniserStateVars.spaceByte, count: fillCount)
+                }
+            }
+        }
+        let appendCount = newSize - internalBuffer.count
+        if appendCount > 0 {
+            internalBuffer.append(contentsOf: repeatElement(TokeniserStateVars.spaceByte, count: appendCount))
+        }
+        size = newSize
     }
     
     @inline(__always)
@@ -181,6 +260,22 @@ open class StringBuilder {
     @discardableResult
     @inline(__always)
     open func append(_ value: ArraySlice<UInt8>) -> StringBuilder {
+        if value.count == 1, let byte = value.first {
+            write(byte)
+            return self
+        }
+        write(contentsOf: value)
+        return self
+    }
+
+    @discardableResult
+    @inline(__always)
+    @usableFromInline
+    func append(_ value: ByteSlice) -> StringBuilder {
+        if value.count == 1, let byte = value.first {
+            write(byte)
+            return self
+        }
         write(contentsOf: value)
         return self
     }
@@ -188,6 +283,10 @@ open class StringBuilder {
     @discardableResult
     @inline(__always)
     open func append(_ value: [UInt8]) -> StringBuilder {
+        if value.count == 1 {
+            write(value[0])
+            return self
+        }
         write(contentsOf: value)
         return self
     }
@@ -266,6 +365,22 @@ open class StringBuilder {
         return out
     }
 
+    @usableFromInline
+    @inline(__always)
+    internal func takeSlice() -> ByteSlice {
+        if size == 0 {
+            return ByteSlice.empty
+        }
+        if size < internalBuffer.count {
+            internalBuffer.removeSubrange(size..<internalBuffer.count)
+        }
+        let out = internalBuffer
+        internalBuffer = []
+        internalBuffer.reserveCapacity(1024)
+        size = 0
+        return ByteSlice.fromArray(out)
+    }
+
     
     @usableFromInline
     @inline(__always)
@@ -325,7 +440,9 @@ open class StringBuilder {
             if count == 0 { return true }
             let newSize = size + count
             if size == internalBuffer.count {
-                internalBuffer.append(contentsOf: buffer)
+                if let base = buffer.baseAddress {
+                    internalBuffer.append(contentsOf: UnsafeBufferPointer(start: base, count: count))
+                }
                 size = newSize
                 return true
             }
@@ -368,7 +485,10 @@ open class StringBuilder {
             if count == 0 { return }
             let newSize = size + count
             if size == internalBuffer.count {
-                internalBuffer.append(contentsOf: bytes)
+                bytes.withUnsafeBufferPointer { src in
+                    guard let base = src.baseAddress else { return }
+                    internalBuffer.append(contentsOf: UnsafeBufferPointer(start: base, count: count))
+                }
                 size = newSize
                 return
             }
@@ -382,7 +502,65 @@ open class StringBuilder {
                     }
                 }
                 if count > available {
-                    internalBuffer.append(contentsOf: bytes[bytes.index(bytes.startIndex, offsetBy: available)...])
+                    bytes.withUnsafeBufferPointer { src in
+                        guard let srcBase = src.baseAddress else { return }
+                        internalBuffer.append(
+                            contentsOf: UnsafeBufferPointer(
+                                start: srcBase.advanced(by: available),
+                                count: count - available
+                            )
+                        )
+                    }
+                }
+                size = newSize
+                return
+            }
+        }
+        let newSize = size + bytes.count
+        if size == internalBuffer.count {
+            internalBuffer.append(contentsOf: bytes)
+        } else if newSize <= internalBuffer.count {
+            internalBuffer.replaceSubrange(size..<newSize, with: bytes)
+        } else {
+            internalBuffer.replaceSubrange(size..<internalBuffer.count, with: bytes)
+        }
+        size = newSize
+    }
+
+    @usableFromInline
+    @inline(__always)
+    internal func write(contentsOf bytes: ByteSlice) {
+        if Self.useFastWrite {
+            let count = bytes.count
+            if count == 0 { return }
+            let newSize = size + count
+            if size == internalBuffer.count {
+                bytes.withUnsafeBufferPointer { src in
+                    guard let base = src.baseAddress else { return }
+                    internalBuffer.append(contentsOf: UnsafeBufferPointer(start: base, count: count))
+                }
+                size = newSize
+                return
+            }
+            let available = internalBuffer.count - size
+            if available > 0 {
+                let firstCount = min(count, available)
+                internalBuffer.withUnsafeMutableBufferPointer { dst in
+                    bytes.withUnsafeBufferPointer { src in
+                        guard let dstBase = dst.baseAddress, let srcBase = src.baseAddress else { return }
+                        dstBase.advanced(by: size).update(from: srcBase, count: firstCount)
+                    }
+                }
+                if count > available {
+                    bytes.withUnsafeBufferPointer { src in
+                        guard let srcBase = src.baseAddress else { return }
+                        internalBuffer.append(
+                            contentsOf: UnsafeBufferPointer(
+                                start: srcBase.advanced(by: available),
+                                count: count - available
+                            )
+                        )
+                    }
                 }
                 size = newSize
                 return

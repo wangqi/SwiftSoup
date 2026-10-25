@@ -67,20 +67,56 @@ open class Token {
         func getName() -> [UInt8] {
             return Array(name.buffer)
         }
+
+        @inline(__always)
+        func getNameSlice() -> ByteSlice {
+            return name.asByteSlice()
+        }
+
+        @inline(__always)
+        func takeNameSlice() -> ByteSlice {
+            return name.takeSlice()
+        }
         
         @inline(__always)
         func getPubSysKey() -> [UInt8]? {
             return pubSysKey
+        }
+
+        @inline(__always)
+        func getPubSysKeySlice() -> ByteSlice? {
+            guard let pubSysKey else { return nil }
+            return ByteSlice.fromArray(pubSysKey)
         }
         
         @inline(__always)
         func getPublicIdentifier() -> [UInt8] {
             return Array(publicIdentifier.buffer)
         }
+
+        @inline(__always)
+        func getPublicIdentifierSlice() -> ByteSlice {
+            return publicIdentifier.asByteSlice()
+        }
+
+        @inline(__always)
+        func takePublicIdentifierSlice() -> ByteSlice {
+            return publicIdentifier.takeSlice()
+        }
         
         @inline(__always)
         public func getSystemIdentifier() -> [UInt8] {
             return Array(systemIdentifier.buffer)
+        }
+
+        @inline(__always)
+        func getSystemIdentifierSlice() -> ByteSlice {
+            return systemIdentifier.asByteSlice()
+        }
+
+        @inline(__always)
+        func takeSystemIdentifierSlice() -> ByteSlice {
+            return systemIdentifier.takeSlice()
         }
         
         @inline(__always)
@@ -173,6 +209,10 @@ open class Token {
             case ruby
             case rp
             case rt
+            case rb
+            case sub
+            case sup
+            case code
 
         }
 
@@ -203,6 +243,7 @@ open class Token {
                 TagIdEntry(bytes: UTF8Arrays.dl, id: .dl),
                 TagIdEntry(bytes: UTF8Arrays.ol, id: .ol),
                 TagIdEntry(bytes: UTF8Arrays.ul, id: .ul),
+                TagIdEntry(bytes: UTF8Arrays.rb, id: .rb),
                 TagIdEntry(bytes: UTF8Arrays.rp, id: .rp),
                 TagIdEntry(bytes: UTF8Arrays.rt, id: .rt),
                 TagIdEntry(bytes: UTF8Arrays.h1, id: .h1),
@@ -218,6 +259,8 @@ open class Token {
                 TagIdEntry(bytes: UTF8Arrays.img, id: .img),
                 TagIdEntry(bytes: UTF8Arrays.col, id: .col),
                 TagIdEntry(bytes: UTF8Arrays.pre, id: .pre),
+                TagIdEntry(bytes: UTF8Arrays.sub, id: .sub),
+                TagIdEntry(bytes: UTF8Arrays.sup, id: .sup),
                 TagIdEntry(bytes: UTF8Arrays.nav, id: .nav),
                 TagIdEntry(bytes: UTF8Arrays.dir, id: .dir)
             ]
@@ -228,6 +271,7 @@ open class Token {
                 TagIdEntry(bytes: UTF8Arrays.head, id: .head),
                 TagIdEntry(bytes: UTF8Arrays.form, id: .form),
                 TagIdEntry(bytes: UTF8Arrays.meta, id: .meta),
+                TagIdEntry(bytes: UTF8Arrays.code, id: .code),
                 TagIdEntry(bytes: UTF8Arrays.base, id: .base),
                 TagIdEntry(bytes: UTF8Arrays.menu, id: .menu),
                 TagIdEntry(bytes: UTF8Arrays.ruby, id: .ruby)
@@ -302,20 +346,24 @@ open class Token {
         }()
 
         public var _tagName: [UInt8]?
-        private var _tagNameS: ArraySlice<UInt8>?
+        private var _tagNameS: ByteSlice?
         public var _normalName: [UInt8]? // lc version of tag name, for case insensitive tree build
         private var _tagNameHasUppercase: Bool = false
         private var _pendingAttributeNameHasUppercase: Bool = false
         private var _pendingAttributeName: [UInt8]? // attribute names are generally caught in one hop, not accumulated
-        private var _pendingAttributeNameS: ArraySlice<UInt8>? // fast path to avoid copying name slices
+        private var _pendingAttributeNameS: ByteSlice? // fast path to avoid copying name slices
         private let _pendingAttributeValue: StringBuilder = StringBuilder() // but values are accumulated, from e.g. & in hrefs
-        private var _pendingAttributeValueS: ArraySlice<UInt8>? // try to get attr vals in one shot, vs Builder
-        private var _pendingAttributeValueSlices: [ArraySlice<UInt8>]? // multiple slices before materializing
+        private var _pendingAttributeValueS: ByteSlice? // try to get attr vals in one shot, vs Builder
+        private var _pendingAttributeValueSlices: [ByteSlice]? // multiple slices before materializing
         private var _pendingAttributeValueSlicesCount: Int = 0
         private var _hasEmptyAttributeValue: Bool = false // distinguish boolean attribute from empty string value
         private var _hasPendingAttributeValue: Bool = false
         fileprivate var _hasAttributes: Bool = false
         fileprivate var _pendingAttributes: [PendingAttribute]? // lazily materialized into Attributes
+        private var _pendingAttributeNameMask: UInt64 = 0
+        private var _pendingAttributeKeys: Set<ByteSlice>?
+        private var _pendingAttributeNameChecked = false
+        private var _discardPendingAttribute = false
         public var _selfClosing: Bool = false
         private var _lowercaseAttributeNames: Bool = false
         fileprivate var _attributesAreNormalized: Bool = false
@@ -354,6 +402,10 @@ open class Token {
             _hasPendingAttributeValue = false
             _hasAttributes = false
             _pendingAttributes?.removeAll(keepingCapacity: true)
+            _pendingAttributeNameMask = 0
+            _pendingAttributeKeys = nil
+            _pendingAttributeNameChecked = false
+            _discardPendingAttribute = false
             _selfClosing = false
             _lowercaseAttributeNames = false
             _attributesAreNormalized = false
@@ -368,7 +420,8 @@ open class Token {
             let pendingNameBytes = _pendingAttributeName
             let hasNameSlice = pendingNameSlice != nil && !(pendingNameSlice?.isEmpty ?? true)
             let hasNameBytes = pendingNameBytes != nil && !(pendingNameBytes?.isEmpty ?? true)
-            if hasNameSlice || hasNameBytes {
+            _ = finaliseAttributeName()
+            if (hasNameSlice || hasNameBytes) && !_discardPendingAttribute {
                 let value: PendingAttrValue
                 if _hasPendingAttributeValue {
                     if !_pendingAttributeValue.isEmpty {
@@ -394,10 +447,8 @@ open class Token {
                 if _pendingAttributes == nil {
                     _pendingAttributes = []
                     _pendingAttributes!.reserveCapacity(8)
-                    _pendingAttributes!.append(pending)
-                } else {
-                    _pendingAttributes!.append(pending)
                 }
+                _pendingAttributes!.append(pending)
                 _hasAttributes = true
                 if _pendingAttributeNameHasUppercase {
                     _hasUppercaseAttributeNames = true
@@ -406,6 +457,8 @@ open class Token {
             _pendingAttributeName = nil
             _pendingAttributeNameS = nil
             _pendingAttributeNameHasUppercase = false
+            _pendingAttributeNameChecked = false
+            _discardPendingAttribute = false
             _hasEmptyAttributeValue = false
             _hasPendingAttributeValue = false
             Token.reset(_pendingAttributeValue)
@@ -413,12 +466,45 @@ open class Token {
             _pendingAttributeValueSlices?.removeAll(keepingCapacity: true)
             _pendingAttributeValueSlicesCount = 0
         }
+
+        /// Register a complete name before consuming its value. The tokenizer reports
+        /// a duplicate at this point even if the tag is later abandoned at EOF.
+        @discardableResult
+        func finaliseAttributeName() -> Bool {
+            guard !_pendingAttributeNameChecked, hasPendingAttributeName() else { return false }
+            _pendingAttributeNameChecked = true
+            let pending = PendingAttribute(
+                nameSlice: _pendingAttributeNameS,
+                nameBytes: _pendingAttributeName,
+                hasUppercase: _pendingAttributeNameHasUppercase,
+                value: .none
+            )
+            _discardPendingAttribute = isDuplicateAttribute(pending)
+            return _discardPendingAttribute
+        }
+
+        /// First occurrence wins. Small canonical batches avoid hashing and trimming;
+        /// larger batches use an index so unique attributes never cause quadratic scans.
+        private func isDuplicateAttribute(_ pending: PendingAttribute) -> Bool {
+            if _pendingAttributeKeys != nil {
+                guard let key = pending.normalizedKey() else { return false }
+                return !_pendingAttributeKeys!.insert(key).inserted
+            }
+            if (_pendingAttributes?.count ?? 0) < 8, let mask = pending.canonicalNameMask() {
+                let mayMatch = _pendingAttributeNameMask & mask != 0
+                _pendingAttributeNameMask |= mask
+                // A mask collision is only a prefilter, never proof of equality.
+                return mayMatch && (_pendingAttributes?.contains { $0.hasSameName(as: pending) } ?? false)
+            }
+            guard let key = pending.normalizedKey() else { return false }
+            _pendingAttributeKeys = Set((_pendingAttributes ?? []).compactMap { $0.normalizedKey() })
+            return !_pendingAttributeKeys!.insert(key).inserted
+        }
         
         @inline(__always)
         func finaliseTag() throws {
             // finalises for emit
             if (_pendingAttributeName != nil || _pendingAttributeNameS != nil) {
-                // todo: check if attribute name exists; if so, drop and error
                 try newAttribute()
             }
         }
@@ -449,18 +535,18 @@ open class Token {
                 }
             }
             if tagId == .none, let normal = _normalName, !normal.isEmpty {
-                setTagIdFromSlice(normal[...])
+                setTagIdFromSlice(ByteSlice.fromArray(normal))
             }
             return _normalName
         }
 
         @inline(__always)
-        func tagNameSlice() -> ArraySlice<UInt8>? {
+        func tagNameSlice() -> ByteSlice? {
             if let name = _tagName {
                 if tagId == .none, !name.isEmpty {
-                    setTagIdFromSlice(name[...])
+                    setTagIdFromSlice(ByteSlice.fromArray(name))
                 }
-                return name[...]
+                return ByteSlice.fromArray(name)
             }
             if let nameSlice = _tagNameS, tagId == .none, !nameSlice.isEmpty {
                 setTagIdFromSlice(nameSlice)
@@ -470,50 +556,50 @@ open class Token {
 
 
         @inline(__always)
-        func normalNameSlice() -> ArraySlice<UInt8>? {
+        func normalNameSlice() -> ByteSlice? {
             if tagId != .none {
                 if _normalName == nil {
                     _normalName = tagIdName()
                 }
-                return _normalName?[...]
+                return _normalName.map(ByteSlice.fromArray)
             }
             if let normal = _normalName {
-                return normal[...]
+                return ByteSlice.fromArray(normal)
             }
             if _tagNameHasUppercase {
                 if let name = _tagName, !name.isEmpty {
                     let lowered = name.lowercased()
                     _normalName = lowered
                     if tagId == .none, !lowered.isEmpty {
-                        setTagIdFromSlice(lowered[...])
+                        setTagIdFromSlice(ByteSlice.fromArray(lowered))
                     }
-                    return lowered[...]
+                    return ByteSlice.fromArray(lowered)
                 }
                 if let nameSlice = _tagNameS, !nameSlice.isEmpty {
                     let lowered = Array(nameSlice.lowercased())
                     _normalName = lowered
                     if tagId == .none, !lowered.isEmpty {
-                        setTagIdFromSlice(lowered[...])
+                        setTagIdFromSlice(ByteSlice.fromArray(lowered))
                     }
-                    return lowered[...]
+                    return ByteSlice.fromArray(lowered)
                 }
                 return nil
             }
             if let name = _tagName {
-                return name[...]
+                return ByteSlice.fromArray(name)
             }
             return _tagNameS
         }
 
         @inline(__always)
         func normalNameEquals(_ lower: [UInt8]) -> Bool {
-            return normalNameEquals(lower[...])
+            return normalNameEquals(ByteSlice.fromArray(lower))
         }
 
         @inline(__always)
-        func normalNameEquals(_ lower: ArraySlice<UInt8>) -> Bool {
+        func normalNameEquals(_ lower: ByteSlice) -> Bool {
             @inline(__always)
-            func equalsArraySlice(_ array: [UInt8], _ slice: ArraySlice<UInt8>) -> Bool {
+            func equalsArraySlice(_ array: [UInt8], _ slice: ByteSlice) -> Bool {
                 if array.count != slice.count {
                     return false
                 }
@@ -603,8 +689,13 @@ open class Token {
         @inline(__always)
         func ensureAttributes() {
             guard let pendingAttributes = _pendingAttributes, !pendingAttributes.isEmpty else { return }
+            _pendingAttributeNameMask = 0
+            _pendingAttributeKeys = nil
             if _attributes == nil {
-                _attributes = Attributes()
+                _attributes = Attributes(pendingAttributes: pendingAttributes)
+                // The collection now owns the buffer; do not copy it just to clear the token.
+                _pendingAttributes = nil
+                return
             }
             for pending in pendingAttributes {
                 _attributes?.appendPending(pending)
@@ -615,17 +706,17 @@ open class Token {
         // these appenders are rarely hit in not null state-- caused by null chars.
         @inline(__always)
         func appendTagName(_ append: [UInt8]) {
-            appendTagName(append[...])
+            appendTagName(ByteSlice.fromArray(append))
         }
         
         // these appenders are rarely hit in not null state-- caused by null chars.
         @inline(__always)
-        func appendTagName(_ append: ArraySlice<UInt8>) {
+        func appendTagName(_ append: ByteSlice) {
             appendTagName(append, hasUppercase: Attributes.containsAsciiUppercase(append))
         }
 
         @inline(__always)
-        func appendTagName(_ append: ArraySlice<UInt8>, hasUppercase: Bool) {
+        func appendTagName(_ append: ByteSlice, hasUppercase: Bool) {
             guard !append.isEmpty else { return }
             tagId = .none
             if _tagName == nil {
@@ -646,7 +737,7 @@ open class Token {
         
         @inline(__always)
         func appendTagName(_ append: UnicodeScalar) {
-            appendTagName(ArraySlice(append.utf8))
+            appendTagName(ByteSlice.fromArray(Array(append.utf8)))
         }
 
         @inline(__always)
@@ -661,7 +752,7 @@ open class Token {
         }
 
         @inline(__always)
-        func appendTagNameLowercased(_ append: ArraySlice<UInt8>) {
+        func appendTagNameLowercased(_ append: ByteSlice) {
             tagId = .none
             if _tagName == nil {
                 if _tagNameS != nil {
@@ -684,7 +775,7 @@ open class Token {
         }
 
         @inline(__always)
-        static func tagIdForSlice(_ slice: ArraySlice<UInt8>) -> TagId? {
+        static func tagIdForSlice(_ slice: ByteSlice) -> TagId? {
             let count = slice.count
             if count == 0 {
                 return nil
@@ -721,7 +812,7 @@ open class Token {
         }
 
         @inline(__always)
-        private static func packSlice(_ slice: ArraySlice<UInt8>) -> UInt64? {
+        private static func packSlice(_ slice: ByteSlice) -> UInt64? {
             let count = slice.count
             if count == 0 || count > 8 {
                 return nil
@@ -740,16 +831,16 @@ open class Token {
             if bytes.isEmpty {
                 return nil
             }
-            return tagIdForSlice(bytes[...])
+            return tagIdForSlice(ByteSlice.fromArray(bytes))
         }
 
         @inline(__always)
-        func setTagIdFromSlice(_ slice: ArraySlice<UInt8>) {
+        func setTagIdFromSlice(_ slice: ByteSlice) {
             tagId = Self.tagIdForSlice(slice) ?? .none
         }
 
         @inline(__always)
-        private static func equalsSlice(_ array: [UInt8], _ slice: ArraySlice<UInt8>) -> Bool {
+        private static func equalsSlice(_ array: [UInt8], _ slice: ByteSlice) -> Bool {
             if array.count != slice.count {
                 return false
             }
@@ -778,7 +869,7 @@ open class Token {
         }
 
         private static let tagIdNameLookup: [[UInt8]?] = {
-            var lookup = [[UInt8]?](repeating: nil, count: Int(TagId.rt.rawValue) + 1)
+            var lookup = [[UInt8]?](repeating: nil, count: Int(TagId.code.rawValue) + 1)
             lookup[Int(TagId.a.rawValue)] = UTF8Arrays.a
             lookup[Int(TagId.span.rawValue)] = UTF8Arrays.span
             lookup[Int(TagId.p.rawValue)] = UTF8Arrays.p
@@ -860,6 +951,10 @@ open class Token {
             lookup[Int(TagId.ruby.rawValue)] = UTF8Arrays.ruby
             lookup[Int(TagId.rp.rawValue)] = UTF8Arrays.rp
             lookup[Int(TagId.rt.rawValue)] = UTF8Arrays.rt
+            lookup[Int(TagId.rb.rawValue)] = UTF8Arrays.rb
+            lookup[Int(TagId.sub.rawValue)] = UTF8Arrays.sub
+            lookup[Int(TagId.sup.rawValue)] = UTF8Arrays.sup
+            lookup[Int(TagId.code.rawValue)] = UTF8Arrays.code
             return lookup
         }()
 
@@ -876,7 +971,7 @@ open class Token {
         }
 
         @inline(__always)
-        private static func equalsLowercased(_ name: ArraySlice<UInt8>, _ lower: ArraySlice<UInt8>) -> Bool {
+        private static func equalsLowercased(_ name: ByteSlice, _ lower: ByteSlice) -> Bool {
             if name.count != lower.count {
                 return false
             }
@@ -901,11 +996,11 @@ open class Token {
         
         @inline(__always)
         func appendAttributeName(_ append: [UInt8]) {
-            appendAttributeName(append[...])
+            appendAttributeName(ByteSlice.fromArray(append))
         }
         
         @inline(__always)
-        func appendAttributeName(_ append: ArraySlice<UInt8>) {
+        func appendAttributeName(_ append: ByteSlice) {
             guard !append.isEmpty else { return }
             if _pendingAttributeName == nil && _pendingAttributeNameS == nil {
                 if _lowercaseAttributeNames {
@@ -999,7 +1094,7 @@ open class Token {
         }
         
         @inline(__always)
-        func appendAttributeValue(_ append: ArraySlice<UInt8>) {
+        func appendAttributeValue(_ append: ByteSlice) {
             if _pendingAttributeValue.isEmpty {
                 if let existing = _pendingAttributeValueS {
                     _pendingAttributeValueSlices = [existing, append]
@@ -1211,6 +1306,16 @@ open class Token {
         func getData() -> [UInt8] {
             return Array(data.buffer)
         }
+
+        @inline(__always)
+        func getDataSlice() -> ByteSlice {
+            return data.asByteSlice()
+        }
+
+        @inline(__always)
+        func takeDataSlice() -> ByteSlice {
+            return data.takeSlice()
+        }
         
         @inline(__always)
         public override func toString() throws -> String {
@@ -1220,7 +1325,7 @@ open class Token {
     
     final class Char: Token {
         public var data: [UInt8]?
-        public var dataSlice: ArraySlice<UInt8>?
+        public var dataSlice: ByteSlice?
         
         override init() {
             super.init()
@@ -1245,7 +1350,7 @@ open class Token {
         }
 
         @inline(__always)
-        func data(_ dataSlice: ArraySlice<UInt8>) -> Char {
+        func data(_ dataSlice: ByteSlice) -> Char {
             self.data = nil
             self.dataSlice = dataSlice
             return self
@@ -1266,12 +1371,12 @@ open class Token {
         }
 
         @inline(__always)
-        func getDataSlice() -> ArraySlice<UInt8>? {
+        func getDataSlice() -> ByteSlice? {
             if let dataSlice {
                 return dataSlice
             }
             if let data {
-                return data[...]
+                return ByteSlice.fromArray(data)
             }
             return nil
         }

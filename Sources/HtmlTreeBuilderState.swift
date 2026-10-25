@@ -76,10 +76,6 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
     }
 
     func process(_ t: Token, _ tb: HtmlTreeBuilder) throws -> Bool {
-        #if PROFILE
-        let _p = Profiler.startDynamic("HtmlTreeBuilderState.\(self)")
-        defer { Profiler.endDynamic("HtmlTreeBuilderState.\(self)", _p) }
-        #endif
         switch self {
         case .Initial:
             if (HtmlTreeBuilderState.isWhitespace(t)) {
@@ -91,11 +87,11 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
                 // todo: quirk state check on doctype ids
                 let d: Token.Doctype = t.asDoctype()
                 let doctype: DocumentType = DocumentType(
-                    tb.settings.normalizeTag(d.getName()),
-                    d.getPubSysKey(),
-                    d.getPublicIdentifier(),
-                    d.getSystemIdentifier(),
-                    tb.getBaseUri()
+                    nameSlice: tb.settings.normalizeTag(d.takeNameSlice()),
+                    pubSysKeySlice: d.getPubSysKeySlice(),
+                    publicIdSlice: d.takePublicIdentifierSlice(),
+                    systemIdSlice: d.takeSystemIdentifierSlice(),
+                    baseUri: tb.getBaseUri()
                 )
                     //tb.settings.normalizeTag(d.getName()), d.getPublicIdentifier(), d.getSystemIdentifier(), tb.getBaseUri())
                 if let range = d.sourceRange {
@@ -323,6 +319,23 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
                 return true
             }
 
+            func equalsSlice(_ array: [UInt8], _ slice: ByteSlice) -> Bool {
+                if array.count != slice.count {
+                    return false
+                }
+                var i = array.startIndex
+                var j = slice.startIndex
+                let end = array.endIndex
+                while i < end {
+                    if array[i] != slice[j] {
+                        return false
+                    }
+                    i = array.index(after: i)
+                    j = slice.index(after: j)
+                }
+                return true
+            }
+
             func anyOtherEndTag(_ t: Token, _ tb: HtmlTreeBuilder) -> Bool {
                 let endTag = t.asEndTag()
                 if let tagName = endTag.tagIdName() {
@@ -461,10 +474,6 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
 
             switch (t.type) {
             case Token.TokenType.Char:
-#if PROFILE
-                let _pChar = Profiler.start("HtmlTreeBuilderState.InBody.char")
-                defer { Profiler.end("HtmlTreeBuilderState.InBody.char", _pChar) }
-#endif
                 let c: Token.Char = t.asCharacter()
                 let data = c.getDataSlice()
                 if let data, data.count == 1, data.first == TokeniserStateVars.nullByte {
@@ -501,21 +510,22 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
                 tb.error(self)
                 return false
             case Token.TokenType.StartTag:
-#if PROFILE
-                let _pStart = Profiler.start("HtmlTreeBuilderState.InBody.startTag")
-                defer { Profiler.end("HtmlTreeBuilderState.InBody.startTag", _pStart) }
-#endif
                 let startTag: Token.StartTag = t.asStartTag()
                 let currentTagId = tb.currentElement()?._tag.tagId
-                var hasFormatting = false
                 var hasFormattingChecked = false
+                var hasFormatting = false
                 @inline(__always)
                 func ensureHasFormatting() -> Bool {
-                    if !hasFormattingChecked {
-                        hasFormatting = tb.lastFormattingElement() != nil
-                        hasFormattingChecked = true
-                    }
+                    if hasFormattingChecked { return hasFormatting }
+                    hasFormattingChecked = true
+                    hasFormatting = tb.lastFormattingElement() != nil
                     return hasFormatting
+                }
+                @inline(__always)
+                func reconstructFormattingIfNeeded() throws {
+                    if ensureHasFormatting() {
+                        try tb.reconstructFormattingElements()
+                    }
                 }
                 @inline(__always)
                 func closePIfInButtonScope() throws {
@@ -540,16 +550,12 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
                             tb.removeFromStack(remainingA!)
                         }
                     }
-                    if ensureHasFormatting() {
-                        try tb.reconstructFormattingElements()
-                    }
+                    try reconstructFormattingIfNeeded()
                     let a = try tb.insert(startTag)
                     tb.pushActiveFormattingElements(a)
                 case .span:
                     // same as final else, but short circuits lots of checks
-                    if ensureHasFormatting() {
-                        try tb.reconstructFormattingElements()
-                    }
+                    try reconstructFormattingIfNeeded()
                     try tb.insert(startTag)
                 case .p, .div:
                     try closePIfInButtonScope()
@@ -590,9 +596,7 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
                     try closePIfInButtonScope()
                     try tb.insert(startTag)
                 case .em, .strong, .b, .i, .small:
-                    if ensureHasFormatting() {
-                        try tb.reconstructFormattingElements()
-                    }
+                    try reconstructFormattingIfNeeded()
                     let el: Element = try tb.insert(startTag)
                     tb.pushActiveFormattingElements(el)
                 case .dd, .dt:
@@ -652,9 +656,7 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
                     // todo: ignore LF if next token
                     tb.framesetOk(false)
                 case .applet, .marquee, .object:
-                    if ensureHasFormatting() {
-                        try tb.reconstructFormattingElements()
-                    }
+                    try reconstructFormattingIfNeeded()
                     try tb.insert(startTag)
                     tb.insertMarkerToFormattingElements()
                     tb.framesetOk(false)
@@ -683,7 +685,7 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
                     if (try tb.inButtonScope(UTF8Arrays.p)) {
                         try tb.processEndTag(UTF8Arrays.p)
                     }
-                    try tb.insertForm(startTag, false)
+                    try tb.insertForm(startTag, true)
                     tb.framesetOk(false)
                 case .html:
                     tb.error(self)
@@ -709,40 +711,45 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
                             }
                         }
                     }
-                case .br, .img:
-                    if ensureHasFormatting() {
-                        try tb.reconstructFormattingElements()
+                case .input:
+                    try reconstructFormattingIfNeeded()
+                    let el: Element = try tb.insertEmpty(startTag)
+                    if try !el.attr("type").equalsIgnoreCase(string: "hidden") {
+                        tb.framesetOk(false)
                     }
+                case .br, .img:
+                    try reconstructFormattingIfNeeded()
                     try tb.insertEmpty(startTag)
                     tb.framesetOk(false)
                 case .hr:
-                    if ensureHasFormatting() {
-                        try tb.reconstructFormattingElements()
-                    }
+                    try reconstructFormattingIfNeeded()
                     try tb.insertEmpty(startTag)
                     tb.framesetOk(false)
                 case .meta, .script, .style, .title:
                     return try tb.process(t, .InHead)
+                case .textarea:
+                    try HtmlTreeBuilderState.handleRcData(startTag, tb)
+                    // Retain SwiftSoup's existing leading-whitespace policy.
+                    tb.framesetOk(false)
+                case .iframe:
+                    tb.framesetOk(false)
+                    try HtmlTreeBuilderState.handleRawtext(startTag, tb)
+                case .noembed:
+                    try HtmlTreeBuilderState.handleRawtext(startTag, tb)
                 case .select:
-                    if ensureHasFormatting() {
-                        try tb.reconstructFormattingElements()
-                    }
+                    try reconstructFormattingIfNeeded()
                     try tb.insert(startTag)
                     tb.framesetOk(false)
                     tb.transition(.InSelect)
                 case .plaintext:
-                    if ensureHasFormatting() {
-                        try tb.reconstructFormattingElements()
-                    }
+                    try reconstructFormattingIfNeeded()
                     try tb.insert(startTag)
                     tb.tokeniser.transition(.PLAINTEXT)
                 case .option, .optgroup:
                     if let currentTagId, currentTagId == .option {
                         try tb.processEndTag(UTF8Arrays.option)
                     }
-                    if ensureHasFormatting() {
-                        try tb.reconstructFormattingElements()
-                    }
+                    try reconstructFormattingIfNeeded()
                     try tb.insert(startTag)
                 default:
                     @inline(__always)
@@ -788,7 +795,7 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
                             if (try tb.inButtonScope(UTF8Arrays.p)) {
                                 try tb.processEndTag(UTF8Arrays.p)
                             }
-                            try tb.insertForm(startTag, false)
+                            try tb.insertForm(startTag, true)
                             tb.framesetOk(false)
                             return true
                         }
@@ -806,17 +813,13 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
                             return true
                         }
                         if Constants.Formatters.containsTagId(tagId) {
-                            if ensureHasFormatting() {
-                                try tb.reconstructFormattingElements()
-                            }
+                            try reconstructFormattingIfNeeded()
                             let el: Element = try tb.insert(startTag)
                             tb.pushActiveFormattingElements(el)
                             return true
                         }
                         if Constants.InBodyStartEmptyFormatters.containsTagId(tagId) {
-                            if ensureHasFormatting() {
-                                try tb.reconstructFormattingElements()
-                            }
+                            try reconstructFormattingIfNeeded()
                             try tb.insertEmpty(startTag)
                             tb.framesetOk(false)
                             return true
@@ -881,9 +884,7 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
                             return true
                         }
                         if Constants.InBodyStartApplets.containsTagId(tagId) {
-                            if ensureHasFormatting() {
-                                try tb.reconstructFormattingElements()
-                            }
+                            try reconstructFormattingIfNeeded()
                             try tb.insert(startTag)
                             tb.insertMarkerToFormattingElements()
                             tb.framesetOk(false)
@@ -897,9 +898,7 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
                             if let currentTagId, currentTagId == .option {
                                 try tb.processEndTag(UTF8Arrays.option)
                             }
-                            if ensureHasFormatting() {
-                                try tb.reconstructFormattingElements()
-                            }
+                            try reconstructFormattingIfNeeded()
                             try tb.insert(startTag)
                             return true
                         }
@@ -921,7 +920,7 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
                         return nil
                     }
 
-                    var nameSlice: ArraySlice<UInt8>? = nil
+                    var nameSlice: ByteSlice? = nil
                     if startTag.tagId == .none {
                         nameSlice = startTag.normalNameSlice()
                     }
@@ -932,16 +931,17 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
                         nameSlice = startTag.normalNameSlice()
                     }
                     if let nameSlice = nameSlice {
-                        if Constants.Formatters.contains(nameSlice) {
-                            if ensureHasFormatting() {
-                                try tb.reconstructFormattingElements()
-                            }
+                        if equalsSlice(UTF8Arrays.xmp, nameSlice) {
+                            try closePIfInButtonScope()
+                            try reconstructFormattingIfNeeded()
+                            tb.framesetOk(false)
+                            try HtmlTreeBuilderState.handleRawtext(startTag, tb)
+                        } else if Constants.Formatters.contains(nameSlice) {
+                            try reconstructFormattingIfNeeded()
                             let el: Element = try tb.insert(startTag)
                             tb.pushActiveFormattingElements(el)
                         } else if Constants.InBodyStartEmptyFormatters.contains(nameSlice) {
-                            if ensureHasFormatting() {
-                                try tb.reconstructFormattingElements()
-                            }
+                            try reconstructFormattingIfNeeded()
                             try tb.insertEmpty(startTag)
                             tb.framesetOk(false)
                         // The same missing `input` rule on the name-slice path, which is what runs
@@ -979,7 +979,7 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
                             if (try tb.inButtonScope(UTF8Arrays.p)) {
                                 try tb.processEndTag(UTF8Arrays.p)
                             }
-                            try tb.insertForm(startTag, false)
+                            try tb.insertForm(startTag, true)
                             tb.framesetOk(false)
                         } else if equalsSlice(UTF8Arrays.table, nameSlice) {
                             if (try tb.inButtonScope(UTF8Arrays.p)) {
@@ -1037,21 +1037,23 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
                             }
                             try tb.insert(startTag)
                         } else if Constants.InBodyStartApplets.contains(nameSlice) {
-                            if ensureHasFormatting() {
-                                try tb.reconstructFormattingElements()
-                            }
+                            try reconstructFormattingIfNeeded()
                             try tb.insert(startTag)
                             tb.insertMarkerToFormattingElements()
                             tb.framesetOk(false)
                         } else if Constants.InBodyStartMedia.contains(nameSlice) {
                             try tb.insertEmpty(startTag)
+                        } else if equalsSlice(UTF8Arrays.input, nameSlice) {
+                            try reconstructFormattingIfNeeded()
+                            let el: Element = try tb.insertEmpty(startTag)
+                            if try !el.attr("type").equalsIgnoreCase(string: "hidden") {
+                                tb.framesetOk(false)
+                            }
                         } else if Constants.InBodyStartOptions.contains(nameSlice) {
                             if let currentTagId, currentTagId == .option {
                                 try tb.processEndTag(UTF8Arrays.option)
                             }
-                            if ensureHasFormatting() {
-                                try tb.reconstructFormattingElements()
-                            }
+                            try reconstructFormattingIfNeeded()
                             try tb.insert(startTag)
                         } else if Constants.InBodyStartRuby.contains(nameSlice) {
                             if (try tb.inScope(UTF8Arrays.ruby)) {
@@ -1067,26 +1069,18 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
                             return false
                         } else {
                             // Fallback path (includes previously the "name == nil" case): always reconstruct and insert.
-                            if ensureHasFormatting() {
-                                try tb.reconstructFormattingElements()
-                            }
+                            try reconstructFormattingIfNeeded()
                             try tb.insert(startTag)
                         }
                     } else {
                         // Fallback path (includes previously the "name == nil" case): always reconstruct and insert.
-                        if ensureHasFormatting() {
-                            try tb.reconstructFormattingElements()
-                        }
+                        try reconstructFormattingIfNeeded()
                         try tb.insert(startTag)
                     }
                 }
                 break
 
             case .EndTag:
-#if PROFILE
-                let _pEnd = Profiler.start("HtmlTreeBuilderState.InBody.endTag")
-                defer { Profiler.end("HtmlTreeBuilderState.InBody.endTag", _pEnd) }
-#endif
                 let endTag: Token.EndTag = t.asEndTag()
                 let currentTagId = tb.currentElement()?._tag.tagId
                 var adoptionName: [UInt8]? = nil
@@ -1262,6 +1256,10 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
                             return false
                         } else {
                             // todo: error if stack contains something not dd, dt, li, optgroup, option, p, rp, rt, tbody, td, tfoot, th, thead, tr, body, html
+                            tb.completeSourceRangeForOpenElement(
+                                UTF8Arrays.body,
+                                endingAt: endTag
+                            )
                             tb.transition(.AfterBody)
                         }
                         return true
@@ -1391,6 +1389,10 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
                                 return false
                             } else {
                                 // todo: error if stack contains something not dd, dt, li, optgroup, option, p, rp, rt, tbody, td, tfoot, th, thead, tr, body, html
+                                tb.completeSourceRangeForOpenElement(
+                                    UTF8Arrays.body,
+                                    endingAt: endTag
+                                )
                                 tb.transition(.AfterBody)
                             }
                         } else if name == UTF8Arrays.html {
@@ -1558,8 +1560,8 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
                         let isHidden: Bool
                         if startTag.hasAnyAttributes() {
                             startTag.ensureAttributes()
-                            let typeValue = startTag._attributes?.get(key: UTF8Arrays.type) ?? []
-                            isHidden = typeValue.equalsIgnoreCase(string: UTF8Arrays.hidden)
+                            let typeValue = (try? startTag._attributes?.getIgnoreCaseSlice(key: UTF8Arrays.type)) ?? ByteSlice.empty
+                            isHidden = StringUtil.equalsIgnoreCase(UTF8Arrays.hidden, typeValue)
                         } else {
                             isHidden = false
                         }
@@ -1612,8 +1614,8 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
                         let isHidden: Bool
                         if startTag.hasAnyAttributes() {
                             startTag.ensureAttributes()
-                            let typeValue = startTag._attributes?.get(key: UTF8Arrays.type) ?? []
-                            isHidden = typeValue.equalsIgnoreCase(string: UTF8Arrays.hidden)
+                            let typeValue = (try? startTag._attributes?.getIgnoreCaseSlice(key: UTF8Arrays.type)) ?? ByteSlice.empty
+                            isHidden = StringUtil.equalsIgnoreCase(UTF8Arrays.hidden, typeValue)
                         } else {
                             isHidden = false
                         }
@@ -2402,6 +2404,10 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
                     tb.error(self)
                     return false
                 } else {
+                    tb.completeSourceRangeForOpenElement(
+                        UTF8Arrays.html,
+                        endingAt: t.asEndTag()
+                    )
                     tb.transition(.AfterAfterBody)
                 }
             } else if (t.isEOF()) {
@@ -2523,20 +2529,43 @@ enum HtmlTreeBuilderState: String, HtmlTreeBuilderStateProtocol {
         guard let data else { return true }
         if data.isEmpty { return true }
         let table = HtmlTreeBuilderState.whitespaceTable
-        if let first = data.first, !table[Int(first)] {
-            return false
-        }
-        if data.count == 1 {
+        return data.withUnsafeBufferPointer { buf in
+            guard let base = buf.baseAddress else { return true }
+            let count = buf.count
+            if count == 0 { return true }
+            if !table[Int(base[0])] { return false }
+            if count == 1 { return true }
+            var i = 1
+            while i < count {
+                if !table[Int(base[i])] {
+                    return false
+                }
+                i &+= 1
+            }
             return true
         }
-        var it = data.index(after: data.startIndex)
-        while it < data.endIndex {
-            if !table[Int(data[it])] {
-                return false
+    }
+
+    @inline(__always)
+    internal static func isWhitespace(_ data: ByteSlice?) -> Bool {
+        guard let data else { return true }
+        if data.isEmpty { return true }
+        let table = HtmlTreeBuilderState.whitespaceTable
+        return data.withUnsafeBytes { buf in
+            guard let base = buf.baseAddress else { return true }
+            let count = buf.count
+            if count == 0 { return true }
+            if !table[Int(base[0])] { return false }
+            if count == 1 { return true }
+            var i = 1
+            while i < count {
+                if !table[Int(base[i])] {
+                    return false
+                }
+                i &+= 1
             }
-            it = data.index(after: it)
+            return true
         }
-        return true
     }
 
     @inline(__always)

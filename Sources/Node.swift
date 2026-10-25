@@ -21,8 +21,12 @@ internal final class Weak<T: AnyObject> {
 }
 
 open class Node: Equatable, Hashable {
+    @usableFromInline
     var baseUri: [UInt8]?
-    var attributes: Attributes?
+    @usableFromInline
+    var attributes: Attributes? {
+        didSet { attributes?.addOwner(self) }
+    }
 
     @inline(__always)
     internal func ensureAttributesForWrite() -> Attributes {
@@ -30,9 +34,6 @@ open class Node: Equatable, Hashable {
             return attributes
         }
         let created = Attributes()
-        if let element = self as? Element {
-            created.ownerElement = element
-        }
         attributes = created
         return created
     }
@@ -117,6 +118,7 @@ open class Node: Equatable, Hashable {
         }
         self.baseUri = baseUri.trim()
         self.attributes = attributes
+        attributes.addOwner(self)
     }
 
     public init(
@@ -130,6 +132,7 @@ open class Node: Equatable, Hashable {
         }
         self.baseUri = baseUri.trim()
         self.attributes = attributes
+        attributes?.addOwner(self)
     }
     
     public init(
@@ -159,16 +162,34 @@ open class Node: Equatable, Hashable {
         self.baseUri = nil
     }
 
-    // Release the subtree with an explicit stack: the default deinit frees each child from inside its parent's deinit, which overflowed the stack on deeply nested input (~5000 levels on a 512 KB thread). A child still referenced elsewhere keeps its own children. // wangqi modified 2026-10-20
     deinit {
-        guard !childNodes.isEmpty else { return }
-        var pending = childNodes
-        childNodes.removeAll()
-        while var node = pending.popLast() {
-            if isKnownUniquelyReferenced(&node), !node.childNodes.isEmpty {
-                pending.append(contentsOf: node.childNodes)
-                node.childNodes.removeAll()
+        // `childNodes` holds strong references, so the default release chain
+        // (Node.deinit -> release childNodes -> child Node.deinit -> ...) recurses
+        // once per nesting level. Deeply nested HTML overflows small thread stacks,
+        // so unwind the subtree iteratively instead.
+        tearDownChildNodesIteratively()
+    }
+
+    /// Releases the descendant subtree without recursing through `deinit`.
+    ///
+    /// Children are drained onto a work stack; a popped node held only by the
+    /// stack (`isKnownUniquelyReferenced`) is about to deinit, so its own
+    /// children are hoisted onto the stack and its `childNodes` cleared before
+    /// it is dropped - it then deinits with an empty `childNodes` and the chain
+    /// never nests. Nodes still referenced elsewhere are left fully intact, so
+    /// this is behaviourally identical to the default recursive release.
+    private func tearDownChildNodesIteratively() {
+        if childNodes.isEmpty { return }
+        var stack = childNodes
+        childNodes.removeAll(keepingCapacity: false)
+        while !stack.isEmpty {
+            var node = stack.removeLast()
+            if isKnownUniquelyReferenced(&node) && !node.childNodes.isEmpty {
+                stack.append(contentsOf: node.childNodes)
+                node.childNodes.removeAll(keepingCapacity: false)
             }
+            // `node` leaves scope here: if it was uniquely held it deinits now,
+            // with an already-empty `childNodes`, so no recursion occurs.
         }
     }
 
@@ -187,7 +208,7 @@ open class Node: Equatable, Hashable {
     /**
      Get an attribute's value by its key. **Case insensitive.**
      
-     To get an absolute URL from an attribute that may be a relative URL, prefix the key with `abs`,
+     To get an absolute URL from an attribute that may be relative to the element's base URI, prefix the key with `abs`,
      which is a shortcut to the ``absUrl(_:)-(String)`` method.
      
      E.g.:
@@ -206,9 +227,9 @@ open class Node: Equatable, Hashable {
             }
             return Node.empty
         }
-        let val: [UInt8] = try attributes.getIgnoreCase(key: attributeKey)
-        if !val.isEmpty {
-            return val
+        let valSlice = try attributes.getIgnoreCaseSlice(key: attributeKey)
+        if !valSlice.isEmpty {
+            return valSlice.toArray()
         } else if Node.hasAbsPrefix(attributeKey) {
             return try absUrl(attributeKey.substring(Node.abs.count))
         } else {
@@ -243,6 +264,11 @@ open class Node: Equatable, Hashable {
     
     @discardableResult
     open func attr(_ attributeKey: String, _ attributeValue: String) throws -> Node {
+        if let lookup = UTF8Arrays.attributeLookup[attributeKey] {
+            try ensureAttributesForWrite().put(lookup, attributeValue.utf8Array)
+            markSourceDirty()
+            return self
+        }
         try ensureAttributesForWrite().put(attributeKey, attributeValue)
         markSourceDirty()
         return self
@@ -254,6 +280,9 @@ open class Node: Equatable, Hashable {
      - returns: true if the attribute exists, false if not.
      */
     open func hasAttr(_ attributeKey: String) -> Bool {
+        if let lookup = UTF8Arrays.attributeLookup[attributeKey] {
+            return hasAttr(lookup)
+        }
         return hasAttr(attributeKey.utf8Array)
     }
     
@@ -266,7 +295,7 @@ open class Node: Equatable, Hashable {
         guard let attributes = attributes else {
             return false
         }
-        if attributeKey.starts(with: Node.abs) {
+        if Node.hasAbsPrefix(attributeKey) {
             let key = ArraySlice(attributeKey.dropFirst(Node.absCount))
             do {
                 let abs = try absUrl(key)
@@ -274,7 +303,8 @@ open class Node: Equatable, Hashable {
                     return true
                 }
             } catch {
-                return false
+                // Invalid virtual suffixes must not hide a physical attribute
+                // with the complete name (for example a literal "abs:").
             }
             
         }
@@ -285,7 +315,7 @@ open class Node: Equatable, Hashable {
     /**
      Remove an attribute from this element.
      - parameter attributeKey: The attribute to remove.
-     - returns: this (for chaining)
+     - returns: this node, for chaining
      */
     @discardableResult
     open func removeAttr(_ attributeKey: [UInt8]) throws -> Node {
@@ -296,6 +326,9 @@ open class Node: Equatable, Hashable {
     
     @discardableResult
     open func removeAttr(_ attributeKey: String) throws -> Node {
+        if let lookup = UTF8Arrays.attributeLookup[attributeKey] {
+            return try removeAttr(lookup)
+        }
         return try removeAttr(attributeKey.utf8Array)
     }
     
@@ -328,10 +361,18 @@ open class Node: Equatable, Hashable {
             
             func head(_ node: Node, _ depth: Int) throws {
                 node.baseUri = baseUri
+                (node as? Element)?.invalidateSelectorResultCache()
             }
             
             func tail(_ node: Node, _ depth: Int) throws {
             }
+        }
+        // Resolved-URL selectors may be cached on any subtree or ancestor.
+        // Physical attribute indexes and text caches do not depend on base URI.
+        var ancestor = parentNode
+        while let node = ancestor {
+            (node as? Element)?.invalidateSelectorResultCache()
+            ancestor = node.parentNode
         }
         try traverse(nodeVisitor(baseUri))
     }
@@ -371,15 +412,15 @@ open class Node: Equatable, Hashable {
         if (!hasAttr(keyStr)) {
             return Node.empty // nothing to make absolute with
         } else {
-            return StringUtil.resolve(String(decoding: baseUri!, as: UTF8.self), relUrl: try attr(keyStr)).utf8Array
+            return StringUtil.resolve(String(decoding: getBaseUriUTF8(), as: UTF8.self), relUrl: try attr(keyStr)).utf8Array
         }
     }
     
     /**
      Get a child node by its 0-based index.
      - parameter index: index of child node
-     - returns: the child node at this index.
      - warning: Crashes if the index is out of bounds!
+     - returns: the child node at this index.
      */
     @inline(__always)
     open func childNode(_ index: Int) -> Node {
@@ -449,13 +490,10 @@ open class Node: Equatable, Hashable {
      */
     @inline(__always)
     open func ownerDocument() -> Document? {
-        if let this =  self as? Document {
-            return this
-        } else if (parentNode == nil) {
-            return nil
-        } else {
-            return parentNode!.ownerDocument()
+        if let document = self as? Document {
+            return document
         }
+        return parentNode?.ownerDocument()
     }
 
     /// A token that changes when text content in this node's tree mutates.
@@ -497,17 +535,38 @@ open class Node: Equatable, Hashable {
     @inline(__always)
     @usableFromInline
     internal func markSourceDirty(force: Bool = false) {
-        // Walk the ancestors in a loop instead of recursing: one frame per ancestor overflowed the stack on deeply nested input (~5000 levels on a 512 KB thread) // wangqi modified 2026-10-20
-        var current: Node? = self
-        while let node = current {
-            if node.sourceRangeDirty {
+        markSourceDirty(force: force, registerDirtyRoot: true)
+    }
+
+    @inline(__always)
+    @usableFromInline
+    internal func markSourceDirty(force: Bool = false, registerDirtyRoot: Bool) {
+        var node: Node? = self
+        var shouldRegisterDirtyRoot = registerDirtyRoot
+        while let current = node {
+            if current.sourceRangeDirty {
+                if shouldRegisterDirtyRoot {
+                    current.ownerDocument()?.registerDirtySourceRoot(current)
+                    shouldRegisterDirtyRoot = false
+                }
+                // Parser-synthesized nodes (e.g. an implied tbody) can be dirty
+                // beneath clean, source-ranged ancestors. Mutations must keep
+                // walking so those ancestors cannot replay stale source bytes.
+                if force || current.treeBuilder?.isBulkBuilding == true {
+                    return
+                }
+                node = current.parentNode
+                continue
+            }
+            if !force, current.treeBuilder?.isBulkBuilding == true {
                 return
             }
-            if !force, node.treeBuilder?.isBulkBuilding == true {
-                return
+            current.sourceRangeDirty = true
+            if shouldRegisterDirtyRoot {
+                current.ownerDocument()?.registerDirtySourceRoot(current)
+                shouldRegisterDirtyRoot = false
             }
-            node.sourceRangeDirty = true
-            current = node.parentNode
+            node = current.parentNode
         }
     }
 
@@ -527,6 +586,19 @@ open class Node: Equatable, Hashable {
         sourceRange = range
         sourceRangeIsComplete = true
         sourceRangeDirty = false
+    }
+
+    @inline(__always)
+    @usableFromInline
+    internal func isAncestor(of node: Node) -> Bool {
+        var current = node.parentNode
+        while let candidate = current {
+            if candidate === self {
+                return true
+            }
+            current = candidate.parentNode
+        }
+        return false
     }
     
     /**
@@ -743,6 +815,7 @@ open class Node: Equatable, Hashable {
     
     @inline(__always)
     public func setParentNode(_ parentNode: Node) throws {
+        try parentNode.validateChildInsertion(self)
         if (self.parentNode != nil) {
             try self.parentNode?.removeChild(self)
         }
@@ -753,6 +826,8 @@ open class Node: Equatable, Hashable {
     public func replaceChild(_ out: Node, _ input: Node) throws {
         try Validate.isTrue(val: out.parentNode === self)
         try Validate.notNull(obj: input)
+        guard out !== input else { return }
+        try validateChildInsertion(input)
         if (input.parentNode != nil) {
             try input.parentNode?.removeChild(input)
         }
@@ -793,7 +868,9 @@ open class Node: Equatable, Hashable {
     
     @inline(__always)
     public func addChildren(_ children: [Node]) throws {
-        //most used. short circuit addChildren(int), which hits reindex children and array copy
+        guard !children.isEmpty else { return }
+        // Validate the whole batch before detaching any input from its current tree.
+        for child in children { try validateChildInsertion(child) }
         for child in children {
             try reparentChild(child)
             childNodes.append(child)
@@ -811,28 +888,46 @@ open class Node: Equatable, Hashable {
     
     @inline(__always)
     public func addChildren(_ index: Int, _ children: [Node]) throws {
+        try Validate.isTrue(val: index >= 0 && index <= childNodes.count, msg: "Insert position out of bounds.")
+        guard !children.isEmpty else { return }
+        for input in children { try validateChildInsertion(input) }
+        var insertionIndex = index
         for input in children.reversed() {
+            // The insertion gap belongs to the original list. Removing an earlier
+            // sibling shifts that gap left before inserting at it.
+            if input.parentNode === self && input.siblingIndex < insertionIndex {
+                insertionIndex -= 1
+            }
             try reparentChild(input)
-            childNodes.insert(input, at: index)
-            reindexChildren(index)
+            childNodes.insert(input, at: insertionIndex)
+            reindexChildren(insertionIndex)
             input.markSourceDirty()
         }
         markSourceDirty()
         bumpTextMutationVersion()
     }
-    
+
     @inline(__always)
-    public func reparentChild(_ child: Node)throws {
-        try child.parentNode?.removeChild(child)
+    public func reparentChild(_ child: Node) throws {
+        // setParentNode validates before removing the old parent link.
         try child.setParentNode(self)
         // propagate builder reference for bulk-append checks
         child.treeBuilder = self.treeBuilder
     }
-    
+
+    @inline(__always)
+    @usableFromInline
+    internal func validateChildInsertion(_ child: Node) throws {
+        // A leaf cannot be an ancestor. Keep the common detached-leaf path cheap.
+        try Validate.isTrue(val: child !== self &&
+            (!child.hasChildNodes() || !child.isAncestor(of: self)),
+            msg: "A node cannot contain itself or one of its ancestors.")
+    }
+
     @usableFromInline
     internal func reindexChildren(_ start: Int) {
         for (index, node) in childNodes[start...].enumerated() {
-            node.setSiblingIndex(start + index)
+            node.siblingIndex = start + index
         }
     }
     
@@ -854,6 +949,12 @@ open class Node: Equatable, Hashable {
         }
         
         return siblings
+    }
+
+    @inline(__always)
+    internal func hasSiblingNodes() -> Bool {
+        guard let parent = parentNode else { return false }
+        return parent.childNodes.count > 1
     }
     
     /**
@@ -922,7 +1023,8 @@ open class Node: Equatable, Hashable {
      */
     @inline(__always)
     open func outerHtml() throws -> String {
-        let accum: StringBuilder = StringBuilder(128)
+        let accum = StringBuilder.acquire(estimatedOuterHtmlCapacity())
+        defer { StringBuilder.release(accum) }
         try outerHtml(accum)
         return accum.toString()
     }
@@ -935,7 +1037,8 @@ open class Node: Equatable, Hashable {
     @inline(__always)
     @usableFromInline
     internal func outerHtmlUTF8Internal() throws -> [UInt8] {
-        let accum = StringBuilder(128)
+        let accum = StringBuilder.acquire(estimatedOuterHtmlCapacity())
+        defer { StringBuilder.release(accum) }
         try outerHtmlFast(accum, 0, getOutputSettings(), allowRawSource: true)
         return Array(accum.buffer)
     }
@@ -943,14 +1046,28 @@ open class Node: Equatable, Hashable {
     @inline(__always)
     @usableFromInline
     internal func outerHtmlUTF8Internal(_ out: OutputSettings, allowRawSource: Bool) throws -> [UInt8] {
-        let accum = StringBuilder(128)
+        let accum = StringBuilder.acquire(estimatedOuterHtmlCapacity())
+        defer { StringBuilder.release(accum) }
         try outerHtmlFast(accum, 0, out, allowRawSource: allowRawSource)
         return Array(accum.buffer)
+    }
+
+    @inline(__always)
+    @usableFromInline
+    internal func estimatedOuterHtmlCapacity() -> Int {
+        guard let range = sourceRange, range.isValid else {
+            return 1024
+        }
+        let length = range.end - range.start
+        if length <= 0 {
+            return 1024
+        }
+        return min(max(1024, length), 1_048_576)
     }
     
     // if this node has no document (or parent), retrieve the default output settings
     func getOutputSettings() -> OutputSettings {
-        return ownerDocument() != nil ? ownerDocument()!.outputSettings() : (Document([])).outputSettings()
+        return ownerDocument()?.outputSettings() ?? OutputSettings()
     }
     
     /**
@@ -975,23 +1092,15 @@ open class Node: Equatable, Hashable {
               let range = sourceRange,
               range.isValid,
               let doc = ownerDocument(),
-              let source = sourceBuffer?.bytes ?? doc.sourceBuffer?.bytes
+              let source = sourceBuffer ?? doc.sourceBuffer
         else {
             return nil
         }
-        let syntax = out.syntax()
-        if syntax == .xml && !doc.parsedAsXml {
+        if !out.canReuseSource(parsedAsXml: source.parsedAsXml)
+            || range.end > source.bytes.count {
             return nil
         }
-        if syntax == .html || syntax == .xml {
-            // ok
-        } else {
-            return nil
-        }
-        if range.end > source.count {
-            return nil
-        }
-        return source[range.start..<range.end]
+        return source.bytes[range.start..<range.end]
     }
 
     @inline(__always)
@@ -1007,31 +1116,57 @@ open class Node: Equatable, Hashable {
         return source[range.start..<range.end]
     }
 
+    private struct SerializationFrame {
+        let node: Node
+        let children: [Node]
+        var nextChild: Int
+    }
+
     @inline(__always)
-    private func outerHtmlFast(_ accum: StringBuilder, _ depth: Int, _ out: OutputSettings, allowRawSource: Bool) throws {
-        // Same head / children / tail order as before, driven by an explicit stack instead of one recursive call per level: deeply nested input (~2000 levels on a 512 KB thread) overflowed the stack // wangqi modified 2026-10-20
-        if let raw = rawSourceSlice(out, allowRawSource: allowRawSource) {
-            accum.append(raw)
-            return
-        }
-        try outerHtmlHead(accum, depth, out)
-        var stack: [(node: Node, depth: Int, nextChild: Int)] = [(self, depth, 0)]
-        while let top = stack.last {
-            let children = top.node.childNodes
-            if top.nextChild < children.count {
-                stack[stack.count - 1].nextChild += 1
-                let child = children[top.nextChild]
-                if let raw = child.rawSourceSlice(out, allowRawSource: allowRawSource) {
-                    accum.append(raw)
+    internal func outerHtmlFast(_ accum: StringBuilder, _ depth: Int, _ out: OutputSettings, allowRawSource: Bool) throws {
+        // Keep continuations on the heap rather than recursing once per DOM level.
+        // Snapshot each parent's children after its head callback, just as the
+        // recursive for-in traversal did. Each frame represents one active ancestor,
+        // so its stack position determines depth without storing it separately.
+        var frames: [SerializationFrame] = []
+        var current: Node? = self
+        while let node = current {
+            let nodeDepth = depth + frames.count
+            if let raw = node.rawSourceSlice(out, allowRawSource: allowRawSource) {
+                accum.append(raw)
+            } else {
+                try node.outerHtmlHead(accum, nodeDepth, out)
+                let children = node.childNodes
+                if let first = children.first {
+                    frames.append(SerializationFrame(
+                        node: node, children: children, nextChild: 1
+                    ))
+                    current = first
                     continue
                 }
-                try child.outerHtmlHead(accum, top.depth + 1, out)
-                stack.append((child, top.depth + 1, 0))
-            } else {
-                try top.node.outerHtmlTail(accum, top.depth, out)
-                stack.removeLast()
+                try node.outerHtmlTail(accum, nodeDepth, out)
+            }
+
+            current = nil
+            while let frame = frames.last {
+                if frame.nextChild < frame.children.count {
+                    current = frame.children[frame.nextChild]
+                    frames[frames.count - 1].nextChild += 1
+                    break
+                }
+                frames.removeLast()
+                try frame.node.outerHtmlTail(accum, depth + frames.count, out)
             }
         }
+    }
+
+    @inline(__always)
+    internal func outerHtmlFastWithoutSourceReuse(
+        _ accum: StringBuilder,
+        _ depth: Int,
+        _ out: OutputSettings
+    ) throws {
+        try outerHtmlFast(accum, depth, out, allowRawSource: false)
     }
     
     /**
@@ -1048,7 +1183,8 @@ open class Node: Equatable, Hashable {
     
     @inline(__always)
     public func indent(_ accum: StringBuilder, _ depth: Int, _ out: OutputSettings) {
-        accum.append(UnicodeScalar.BackslashN).append(StringUtil.padding(depth * Int(out.indentAmount())))
+        accum.appendNewline()
+        accum.appendSpaces(depth * Int(out.indentAmount()))
     }
     
     /**
@@ -1113,6 +1249,10 @@ open class Node: Equatable, Hashable {
         // BFS clone using index-based queue, preserving original nodes to avoid extra array copies.
         var queue: [(Node, Node)] = [(self, thisClone)]
         queue.reserveCapacity(8)
+        var formCopies: [(FormElement, FormElement)] = []
+        if let form = self as? FormElement, let formClone = thisClone as? FormElement {
+            formCopies.append((form, formClone))
+        }
         var idx = 0
         while idx < queue.count {
             let (originalParent, cloneParent) = queue[idx]
@@ -1125,6 +1265,9 @@ open class Node: Equatable, Hashable {
                 for child in originalChildren {
                     let childClone = child.copyForDeepClone(parent: cloneParent)
                     newChildren.append(childClone)
+                    if let form = child as? FormElement, let formClone = childClone as? FormElement {
+                        formCopies.append((form, formClone))
+                    }
                     if child.hasChildNodes() {
                         queue.append((child, childClone))
                     }
@@ -1135,6 +1278,9 @@ open class Node: Equatable, Hashable {
             }
         }
         
+        if !formCopies.isEmpty {
+            FormElement.rebindClonedControlAssociations(formCopies, clonedParents: queue)
+        }
         return thisClone
     }
     
@@ -1173,7 +1319,6 @@ open class Node: Equatable, Hashable {
             } else {
                 clone.attributes = attrs.clone()
             }
-            clone.attributes?.ownerElement = clone as? SwiftSoup.Element
         } else {
             clone.attributes = nil
         }
@@ -1248,8 +1393,7 @@ open class Node: Equatable, Hashable {
     /// your program. Do not save hash values to use during a future execution.
     @inline(__always)
     public func hash(into hasher: inout Hasher) {
-        hasher.combine(description)
-        hasher.combine(baseUri)
+        hasher.combine(ObjectIdentifier(self))
     }
 }
 

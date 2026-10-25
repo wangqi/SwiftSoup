@@ -8,45 +8,56 @@
 import Foundation
 
 open class Attribute {
+    // Installed only when a mutable reference escapes to a caller or is shared.
+    // Weak ownership preserves the lifetime of detached attributes and DOM trees.
+    internal var mutationOwners: [Weak<Attributes>]? = nil
+
     /// The element type of a dictionary: a tuple containing an individual
     /// key-value pair.
     static let booleanAttributes = ParsingStrings([
-        "allowfullscreen", "async", "autofocus", "checked", "compact", "controls", "declare", "default", "defer",
+        "allowfullscreen", "async", "autofocus", "checked", "compact", "controls", "crossorigin", "declare", "default", "defer",
         "disabled", "formnovalidate", "hidden", "inert", "ismap", "itemscope", "multiple", "muted", "nohref",
         "noresize", "noshade", "novalidate", "nowrap", "open", "readonly", "required", "reversed", "seamless",
         "selected", "sortable", "truespeed", "typemustmatch"
     ])
     
     @usableFromInline
-    var key: [UInt8]
+    var keySlice: ByteSlice
     @usableFromInline
-    var value: [UInt8]
+    var valueSlice: ByteSlice
     @usableFromInline
-    var keySlice: ArraySlice<UInt8>? = nil
+    var valueSlices: [ByteSlice]? = nil
     @usableFromInline
-    var valueSlice: ArraySlice<UInt8>? = nil
+    var valueSlicesCount: Int = 0
+    @usableFromInline
+    var keyBytes: [UInt8]? = nil
+    @usableFromInline
+    var valueBytes: [UInt8]? = nil
+    @usableFromInline
+    var lowerKeySliceCache: ByteSlice? = nil
+    @usableFromInline
+    var lowerValueSliceCache: ByteSlice? = nil
+    @usableFromInline
+    var lowerTrimmedValueSliceCache: ByteSlice? = nil
     
     public init(key: [UInt8], value: [UInt8]) throws {
-        try Validate.notEmpty(string: key)
-        self.key = key.trim()
-        self.value = value
+        let trimmedKey = ByteSlice.fromArray(key).trim()
+        try Validate.notEmpty(string: trimmedKey)
+        self.keySlice = trimmedKey
+        self.valueSlice = ByteSlice.fromArray(value)
+    }
+
+    public convenience init(keySlice: ArraySlice<UInt8>, valueSlice: ArraySlice<UInt8>) throws {
+        let key = ByteSlice.fromArraySlice(keySlice).trim()
+        let value = ByteSlice.fromArraySlice(valueSlice)
+        try self.init(keySlice: key, valueSlice: value)
     }
 
     @usableFromInline
-    init(keySlice: ArraySlice<UInt8>, valueSlice: ArraySlice<UInt8>) throws {
+    init(keySlice: ByteSlice, valueSlice: ByteSlice) throws {
         let trimmedKey = keySlice.trim()
         try Validate.notEmpty(string: trimmedKey)
-        self.key = []
-        self.value = []
         self.keySlice = trimmedKey
-        self.valueSlice = valueSlice
-    }
-
-    @usableFromInline
-    init(key: [UInt8], valueSlice: ArraySlice<UInt8>) throws {
-        try Validate.notEmpty(string: key)
-        self.key = key.trim()
-        self.value = []
         self.valueSlice = valueSlice
     }
     
@@ -65,7 +76,12 @@ open class Attribute {
     
     @inline(__always)
     open func getKeyUTF8() -> [UInt8] {
-        return ensureKeyMaterialized()
+        if let keyBytes {
+            return keyBytes
+        }
+        let bytes = keySlice.toArray()
+        keyBytes = bytes
+        return bytes
     }
     
     /**
@@ -74,11 +90,21 @@ open class Attribute {
      */
     @inline(__always)
     open func setKey(key: [UInt8]) throws {
-        try Validate.notEmpty(string: key)
-        self.keySlice = nil
-        self.key = key.trim()
+        let trimmedKey = ByteSlice.fromArray(key).trim()
+        try Validate.notEmpty(string: trimmedKey)
+        setNormalizedKey(trimmedKey)
     }
-    
+
+    // The caller validates or normalizes the key before entering this storage-only path.
+    // Normalization must not invoke an arbitrary subclass setter.
+    internal func setNormalizedKey(_ key: ByteSlice) {
+        guard keySlice != key else { return }
+        keySlice = key
+        keyBytes = nil
+        lowerKeySliceCache = nil
+        notifyMutationOwners(keyChanged: true)
+    }
+
     @inline(__always)
     open func setKey(key: String) throws {
         try setKey(key: key.utf8Array)
@@ -95,7 +121,24 @@ open class Attribute {
     
     @inline(__always)
     open func getValueUTF8() -> [UInt8] {
-        return ensureValueMaterialized()
+        if let valueBytes {
+            return valueBytes
+        }
+        if let slices = valueSlices {
+            var out: [UInt8] = []
+            out.reserveCapacity(valueSlicesCount)
+            for slice in slices {
+                out.append(contentsOf: slice)
+            }
+            valueSlices = nil
+            valueSlicesCount = 0
+            valueBytes = out
+            valueSlice = ByteSlice.fromArray(out)
+            return out
+        }
+        let bytes = valueSlice.toArray()
+        valueBytes = bytes
+        return bytes
     }
     
     /**
@@ -105,9 +148,17 @@ open class Attribute {
     @discardableResult
     @inline(__always)
     open func setValue(value: [UInt8]) -> [UInt8] {
-        let old = ensureValueMaterialized()
-        self.valueSlice = nil
-        self.value = value
+        let old = getValueUTF8()
+        // An overridden getter can differ from the stored value. Only skip an
+        // actual storage no-op, while preserving the public getter's return value.
+        guard valueSliceMaterialized() != ByteSlice.fromArray(value) else { return old }
+        valueSlice = ByteSlice.fromArray(value)
+        valueSlices = nil
+        valueSlicesCount = 0
+        valueBytes = nil
+        lowerValueSliceCache = nil
+        lowerTrimmedValueSliceCache = nil
+        notifyMutationOwners(keyChanged: false)
         return old
     }
     
@@ -124,10 +175,10 @@ open class Attribute {
     
     @inline(__always)
     public func html(accum: StringBuilder, out: OutputSettings) {
-        accum.append(getKeyUTF8())
+        accum.append(keySlice)
         if (!shouldCollapseAttribute(out: out)) {
             accum.append(UTF8Arrays.attributeEqualsQuoteMark)
-            Entities.escape(accum, getValueUTF8(), out, true, false, false)
+            Attribute.appendAttributeValue(accum, out, valueSliceMaterialized())
             accum.append(UTF8Arrays.quoteMark)
         }
     }
@@ -155,9 +206,103 @@ open class Attribute {
     
     @inline(__always)
     public func isDataAttribute() -> Bool {
-        let bytes = getKeyUTF8()
-        return bytes.starts(with: Attributes.dataPrefix) && bytes.count > Attributes.dataPrefix.count
+        let key = keySlice
+        let prefix = Attributes.dataPrefix
+        if key.count <= prefix.count { return false }
+        var i = 0
+        while i < prefix.count {
+            if key[i] != prefix[i] {
+                return false
+            }
+            i &+= 1
+        }
+        return true
     }
+
+    @usableFromInline
+    @inline(__always)
+    static func appendAttributeValue(_ accum: StringBuilder, _ out: OutputSettings, _ value: [UInt8]) {
+        if value.isEmpty {
+            return
+        }
+        let escapeMode = out.escapeMode()
+        let encoder = out.encoder()
+        let encoderIsAscii = encoder == .ascii
+        var needsEscape = false
+        value.withUnsafeBufferPointer { buf in
+            guard let base = buf.baseAddress else { return }
+            let len = buf.count
+            var i = 0
+            while i < len {
+                let b = base[i]
+                if encoderIsAscii && b >= Entities.asciiUpperLimitByte {
+                    needsEscape = true
+                    return
+                }
+                if b == TokeniserStateVars.ampersandByte || b == TokeniserStateVars.quoteByte {
+                    needsEscape = true
+                    return
+                }
+                if escapeMode == .xhtml && b == TokeniserStateVars.lessThanByte {
+                    needsEscape = true
+                    return
+                }
+                if b == StringUtil.utf8NBSPLead, i + 1 < len, base[i + 1] == StringUtil.utf8NBSPTrail {
+                    needsEscape = true
+                    return
+                }
+                i += 1
+            }
+        }
+        if !needsEscape {
+            accum.append(value)
+            return
+        }
+        Entities.escape(accum, value, out, true, false, false)
+    }
+
+    @usableFromInline
+    @inline(__always)
+    static func appendAttributeValue(_ accum: StringBuilder, _ out: OutputSettings, _ value: ByteSlice) {
+        if value.isEmpty {
+            return
+        }
+        let escapeMode = out.escapeMode()
+        let encoder = out.encoder()
+        let encoderIsAscii = encoder == .ascii
+        var needsEscape = false
+        value.withUnsafeBytes { buf in
+            guard let base = buf.baseAddress else { return }
+            let len = buf.count
+            var i = 0
+            while i < len {
+                let b = base[i]
+                if encoderIsAscii && b >= Entities.asciiUpperLimitByte {
+                    needsEscape = true
+                    return
+                }
+                if b == TokeniserStateVars.ampersandByte || b == TokeniserStateVars.quoteByte {
+                    needsEscape = true
+                    return
+                }
+                if escapeMode == .xhtml && b == TokeniserStateVars.lessThanByte {
+                    needsEscape = true
+                    return
+                }
+                if b == StringUtil.utf8NBSPLead, i + 1 < len, base[i + 1] == StringUtil.utf8NBSPTrail {
+                    needsEscape = true
+                    return
+                }
+                i += 1
+            }
+        }
+        if !needsEscape {
+            accum.append(value)
+            return
+        }
+        Entities.escape(accum, value, out, true, false, false)
+    }
+
     
     /**
      Collapsible if it's a boolean attribute and value is empty or same as name
@@ -167,64 +312,148 @@ open class Attribute {
      */
     @inline(__always)
     public final func shouldCollapseAttribute(out: OutputSettings) -> Bool {
-        return getValueUTF8().isEmpty
+        return isValueEmpty()
         && out.syntax() == OutputSettings.Syntax.html
         && isBooleanAttribute()
     }
     
     @inline(__always)
     public func isBooleanAttribute() -> Bool {
-        return Attribute.booleanAttributes.contains(getKeyUTF8().lowercased()[...])
+        return Attribute.booleanAttributes.contains(lowerKeySlice())
+    }
+
+    @usableFromInline
+    @inline(__always)
+    func isValueEmpty() -> Bool {
+        if let valueBytes {
+            return valueBytes.isEmpty
+        }
+        if valueSlices != nil {
+            return valueSlicesCount == 0
+        }
+        return valueSlice.isEmpty
+    }
+
+    @usableFromInline
+    @inline(__always)
+    func valueSliceMaterialized() -> ByteSlice {
+        if valueSlices == nil {
+            if !valueSlice.isEmpty {
+                return valueSlice
+            }
+            if let valueBytes {
+                let slice = ByteSlice.fromArray(valueBytes)
+                valueSlice = slice
+                return slice
+            }
+            return valueSlice
+        }
+        let slices = valueSlices ?? []
+        var out: [UInt8] = []
+        out.reserveCapacity(valueSlicesCount)
+        for slice in slices {
+            out.append(contentsOf: slice)
+        }
+        valueSlices = nil
+        valueSlicesCount = 0
+        valueBytes = out
+        let slice = ByteSlice.fromArray(out)
+        valueSlice = slice
+        return slice
+    }
+
+    @usableFromInline
+    @inline(__always)
+    func appendValueSlice(_ slice: ByteSlice) {
+        guard !slice.isEmpty else { return }
+        defer { notifyMutationOwners(keyChanged: false) }
+        valueBytes = nil
+        lowerValueSliceCache = nil
+        lowerTrimmedValueSliceCache = nil
+        if valueSlices != nil {
+            valueSlices!.append(slice)
+            valueSlicesCount += slice.count
+            return
+        }
+        if !valueSlice.isEmpty {
+            valueSlices = [valueSlice, slice]
+            valueSlicesCount = valueSlice.count + slice.count
+            valueSlice = ByteSlice.empty
+        } else {
+            valueSlices = [slice]
+            valueSlicesCount = slice.count
+        }
+    }
+
+    @usableFromInline
+    @inline(__always)
+    func lowerKeySlice() -> ByteSlice {
+        if let cached = lowerKeySliceCache {
+            return cached
+        }
+        let lowered = keySlice.lowercased()
+        lowerKeySliceCache = lowered
+        return lowered
+    }
+
+    @usableFromInline
+    @inline(__always)
+    func lowerValueSlice() -> ByteSlice {
+        if let cached = lowerValueSliceCache {
+            return cached
+        }
+        let lowered = valueSliceMaterialized().lowercased()
+        lowerValueSliceCache = lowered
+        return lowered
+    }
+
+    @usableFromInline
+    @inline(__always)
+    func lowerTrimmedValueSlice() -> ByteSlice {
+        if let cached = lowerTrimmedValueSliceCache {
+            return cached
+        }
+        let lowered = valueSliceMaterialized().trim().lowercased()
+        lowerTrimmedValueSliceCache = lowered
+        return lowered
     }
     
     @inline(__always)
     public func hashCode() -> Int {
-        let keyBytes = getKeyUTF8()
-        let valueBytes = getValueUTF8()
-        var result = keyBytes.hashValue
-        result = 31 * result + valueBytes.hashValue
+        var result = keySlice.hashValue
+        // Hash mixing intentionally wraps at the machine word boundary.
+        result = (31 &* result) &+ valueSliceMaterialized().hashValue
         return result
     }
     
+    // Copy immutable byte storage without sharing the mutable Attribute object or observers.
+    internal init(copying other: Attribute) {
+        keySlice = other.keySlice
+        valueSlice = other.valueSlice
+        valueSlices = other.valueSlices
+        valueSlicesCount = other.valueSlicesCount
+    }
+
     @inline(__always)
     public func clone() -> Attribute {
-        do {
-            return try Attribute(key: getKeyUTF8(), value: getValueUTF8())
-        } catch Exception.Error( _, let  msg) {
-            print(msg)
-        } catch {
-            
+        if type(of: self) == BooleanAttribute.self {
+            return BooleanAttribute(copying: self)
         }
-        return try! Attribute(key: [], value: [])
+        if type(of: self) != Attribute.self,
+           let projected = try? Attribute(key: getKeyUTF8(), value: getValueUTF8()) {
+            // Preserve the existing clone contract for custom getter overrides.
+            // Invalid projected keys fall back to the already-validated storage.
+            return projected
+        }
+        return Attribute(copying: self)
     }
 
-    @inline(__always)
-    @usableFromInline
-    internal func ensureKeyMaterialized() -> [UInt8] {
-        if let slice = keySlice {
-            let materialized = Array(slice)
-            keySlice = nil
-            key = materialized
-        }
-        return key
-    }
-
-    @inline(__always)
-    @usableFromInline
-    internal func ensureValueMaterialized() -> [UInt8] {
-        if let slice = valueSlice {
-            let materialized = Array(slice)
-            valueSlice = nil
-            value = materialized
-        }
-        return value
-    }
 }
 
 extension Attribute: Equatable {
     @inline(__always)
     static public func == (lhs: Attribute, rhs: Attribute) -> Bool {
-        return lhs.getKeyUTF8() == rhs.getKeyUTF8() && lhs.getValueUTF8() == rhs.getValueUTF8()
+        return lhs.keySlice == rhs.keySlice && lhs.valueSliceMaterialized() == rhs.valueSliceMaterialized()
     }
     
 }

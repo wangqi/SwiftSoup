@@ -8,27 +8,60 @@
 import Foundation
 
 	/**
-	 Parse HTML into a Document. The parser will make a sensible, balanced document tree out of any HTML.
-	 
-	 - parameter html:    HTML to parse
-	 - parameter baseUri: The URL where the HTML was retrieved from. Used to resolve relative URLs to absolute URLs, that occur
-	   before the HTML declares a `<base href>` tag.
-	 - returns: sane HTML
+	 Parse markup into a Document with automatic format detection. If the input starts with an XML declaration
+	 (`<?xml`), the XML parser is used; otherwise the HTML parser is applied. Use ``parseHTML(_:_:)`` or
+	 ``parseXML(_:_:)`` to force a specific parser.
+
+	 - parameter html:    markup to parse
+	 - parameter baseUri: The URL where the markup was retrieved from. Used to resolve relative URLs to absolute URLs, that occur
+	   before the markup declares a `<base href>` tag.
+	 - returns: parsed Document
 	*/
 	public func parse(_ html: String, _ baseUri: String) throws -> Document {
+		if looksLikeXml(html) {
+			return try Parser.xmlParser().parseInput(html, baseUri)
+		}
 		return try Parser.parse(html, baseUri)
 	}
 
 	/**
-	 Parse Data into a Document. The parser will make a sensible, balanced document tree out of any HTML.
-	 
-	 - parameter data: Data to parse
-	 - parameter baseUri: The URL where the HTML was retrieved from. Used to resolve relative URLs to absolute URLs, that occur
-	   before the HTML declares a `<base href>` tag.
-	 - returns: sane HTML
+	 Parse Data into a Document with automatic format detection. If the input starts with an XML declaration
+	 (`<?xml`), the XML parser is used; otherwise the HTML parser is applied. Use ``parseHTML(_:_:)`` or
+	 ``parseXML(_:_:)`` to force a specific parser.
+
+	 - parameter data: data to parse
+	 - parameter baseUri: The URL where the markup was retrieved from. Used to resolve relative URLs to absolute URLs, that occur
+	   before the markup declares a `<base href>` tag.
+	 - returns: parsed Document
 	*/
     public func parse(_ data: Data, _ baseUri: String) throws -> Document {
+        let bytes = [UInt8](data)
+        if looksLikeXml(bytes) {
+            return try Parser.xmlParser().parseInput(bytes, baseUri)
+        }
         return try Parser.parse(data, baseUri)
+    }
+
+    /**
+     Parse HTML into a Document using a closure-provided byte buffer.
+
+     - parameter baseUri: The URL where the HTML was retrieved from. Used to resolve relative URLs to absolute URLs.
+     - parameter provider: Closure that supplies a byte buffer and invokes the parse callback within the buffer lifetime.
+     - returns: sane HTML
+     */
+    public func parse(_ baseUri: String,
+                      withBytes provider: (_ parse: (UnsafeBufferPointer<UInt8>) throws -> Document) throws -> Document) rethrows -> Document {
+        return try Parser.parse(baseUri, withBytes: provider)
+    }
+
+    /**
+     Parse HTML into a Document using a closure-provided byte buffer.
+
+     - parameter provider: Closure that supplies a byte buffer and invokes the parse callback within the buffer lifetime.
+     - returns: sane HTML
+     */
+    public func parse(withBytes provider: (_ parse: (UnsafeBufferPointer<UInt8>) throws -> Document) throws -> Document) rethrows -> Document {
+        return try Parser.parse("", withBytes: provider)
     }
 
 	/**
@@ -60,31 +93,174 @@ import Foundation
     }
 
 	/**
-	 Parse HTML into a Document. As no base URI is specified, absolute URL detection relies on the HTML including a
-	 `<base href>` tag.
-	 
-	 - parameter html: HTML to parse
-	 - returns: sane HTML
+	 Parse markup into a Document with automatic format detection. As no base URI is specified, absolute URL
+	 detection relies on the markup including a `<base href>` tag.
+
+	 - parameter html: markup to parse
+	 - returns: parsed Document
 	 - seealso: ``parse(_:_:)-(String,String)``
 	*/
 	public func parse(_ html: String) throws -> Document {
-		return try Parser.parse(html, "")
+		return try parse(html, "")
 	}
 
     /**
-	 Parse Data into a Document. As no base URI is specified, absolute URL detection relies on the HTML including a
-	 `<base href>` tag.
-	 
-	 - parameter data: Data to parse
-	 - returns: sane HTML
+	 Parse Data into a Document with automatic format detection. As no base URI is specified, absolute URL
+	 detection relies on the markup including a `<base href>` tag.
+
+	 - parameter data: data to parse
+	 - returns: parsed Document
 	 - seealso: ``parse(_:_:)-(String,String)``
     */
 	public func parse(_ data: Data) throws -> Document {
-		return try Parser.parse(data, "")
+		return try parse(data, "")
 	}
 
+    /**
+     Parse XML into a Document using the XML parser. Unlike ``parse(_:_:)``, this does not apply HTML5 tree-building
+     rules or normalize known HTML tags like `<link>` or `<img>`.
 
+     - parameter xml: XML to parse
+     - parameter baseUri: The URL where the XML was retrieved from. Used to resolve relative URLs to absolute URLs.
+     - returns: parsed XML document
+     */
+    public func parseXML(_ xml: String, _ baseUri: String) throws -> Document {
+        return try parse(xml, baseUri, Parser.xmlParser())
+    }
 
+    /**
+     Parse XML into a Document using the XML parser. As no base URI is specified, absolute URL detection relies on the
+     XML including a suitable base URI in its own data.
+
+     - parameter xml: XML to parse
+     - returns: parsed XML document
+     */
+    public func parseXML(_ xml: String) throws -> Document {
+        return try parseXML(xml, "")
+    }
+
+    /**
+     Parse XML data into a Document using the XML parser.
+
+     - parameter data: XML data to parse
+     - parameter baseUri: The URL where the XML was retrieved from. Used to resolve relative URLs to absolute URLs.
+     - returns: parsed XML document
+     */
+    public func parseXML(_ data: Data, _ baseUri: String) throws -> Document {
+        return try Parser.xmlParser().parseInput([UInt8](data), baseUri)
+    }
+
+    /**
+     Parse XML data into a Document using the XML parser. As no base URI is specified, absolute URL detection relies on
+     the XML including a suitable base URI in its own data.
+
+     - parameter data: XML data to parse
+     - returns: parsed XML document
+     */
+    public func parseXML(_ data: Data) throws -> Document {
+        return try parseXML(data, "")
+    }
+
+    /**
+     Fetch a URL as raw bytes and parse it as HTML. This avoids relying on Foundation string encoding detection before
+     parsing.
+
+     - parameter url: URL to fetch and parse
+     - returns: sane HTML
+     */
+    public func parse(_ url: URL) throws -> Document {
+        return try parse(Data(contentsOf: url), url.absoluteString)
+    }
+
+    /**
+     Fetch a URL as raw bytes and parse it using the provided parser.
+
+     - parameter url: URL to fetch and parse
+     - parameter parser: alternate parser (e.g. ``Parser/xmlParser()``) to use.
+     - returns: parsed document
+     */
+    public func parse(_ url: URL, _ parser: Parser) throws -> Document {
+        return try parser.parseInput([UInt8](Data(contentsOf: url)), url.absoluteString)
+    }
+
+    // MARK: - Explicit HTML parsing
+
+    /**
+     Parse HTML into a Document using the HTML parser. Unlike ``parse(_:_:)``, this always uses the HTML parser
+     regardless of the input content (no auto-detection).
+
+     - parameter html: HTML to parse
+     - parameter baseUri: The URL where the HTML was retrieved from. Used to resolve relative URLs to absolute URLs.
+     - returns: parsed HTML document
+     */
+    public func parseHTML(_ html: String, _ baseUri: String) throws -> Document {
+        return try Parser.parse(html, baseUri)
+    }
+
+    /**
+     Parse HTML into a Document using the HTML parser. As no base URI is specified, absolute URL detection relies on
+     the HTML including a `<base href>` tag.
+
+     - parameter html: HTML to parse
+     - returns: parsed HTML document
+     */
+    public func parseHTML(_ html: String) throws -> Document {
+        return try parseHTML(html, "")
+    }
+
+    /**
+     Parse HTML data into a Document using the HTML parser.
+
+     - parameter data: HTML data to parse
+     - parameter baseUri: The URL where the HTML was retrieved from. Used to resolve relative URLs to absolute URLs.
+     - returns: parsed HTML document
+     */
+    public func parseHTML(_ data: Data, _ baseUri: String) throws -> Document {
+        return try Parser.parse(data, baseUri)
+    }
+
+    /**
+     Parse HTML data into a Document using the HTML parser. As no base URI is specified, absolute URL detection relies
+     on the HTML including a `<base href>` tag.
+
+     - parameter data: HTML data to parse
+     - returns: parsed HTML document
+     */
+    public func parseHTML(_ data: Data) throws -> Document {
+        return try parseHTML(data, "")
+    }
+
+    // MARK: - Format detection
+
+    private func looksLikeXml(_ string: String) -> Bool {
+        var i = string.startIndex
+        if i < string.endIndex && string[i] == "\u{FEFF}" {
+            i = string.index(after: i)
+        }
+        while i < string.endIndex && string[i].isWhitespace {
+            i = string.index(after: i)
+        }
+        return hasXmlDeclarationPrefix(string[i...].utf8)
+    }
+
+    private func looksLikeXml(_ bytes: [UInt8]) -> Bool {
+        var i = bytes.starts(with: [0xEF, 0xBB, 0xBF]) ? 3 : 0
+        while i < bytes.count && (bytes[i] == 0x20 || bytes[i] == 0x09 || bytes[i] == 0x0A || bytes[i] == 0x0D) {
+            i += 1
+        }
+        return hasXmlDeclarationPrefix(bytes[i...])
+    }
+
+    private func hasXmlDeclarationPrefix<Bytes: Collection>(_ bytes: Bytes) -> Bool where Bytes.Element == UInt8 {
+        var iterator = bytes.makeIterator()
+        for byte in "<?xml".utf8 {
+            guard iterator.next() == byte else { return false }
+        }
+        // Require the complete target, not a PI such as <?xml-stylesheet ...?>.
+        // Keep accepting truncated and empty declarations in this tolerant parser.
+        guard let next = iterator.next() else { return true }
+        return next == 0x20 || next == 0x09 || next == 0x0A || next == 0x0D || next == 0x3F || next == 0x3E
+    }
 
 	//todo:
 //	/**
@@ -226,7 +402,8 @@ import Foundation
 		let dirty: Document = try parseBodyFragment(bodyHtml, baseUri)
 		let cleaner: Cleaner = Cleaner(whitelist)
 		let clean: Document = try cleaner.clean(dirty)
-		return try clean.body()?.html()
+        let html = try clean.body()?.html()
+        return normalizeTextOnlyNbsp(html, whitelist: whitelist)
 	}
 
 	/**
@@ -260,8 +437,23 @@ import Foundation
 		let cleaner: Cleaner = Cleaner(whitelist)
 		let clean: Document = try cleaner.clean(dirty)
 		clean.outputSettings(outputSettings)
-		return try clean.body()?.html()
+        let html = try clean.body()?.html()
+        return normalizeTextOnlyNbsp(html, whitelist: whitelist)
 	}
+
+    private func normalizeTextOnlyNbsp(_ html: String?, whitelist: Whitelist) -> String? {
+        guard whitelist.isTextOnly(), let html else {
+            return html
+        }
+
+        var normalized = html.replacingOccurrences(of: "&nbsp;", with: " ")
+        normalized = normalized.replacingOccurrences(
+            of: "&#(?:160|x[aA]0);",
+            with: " ",
+            options: .regularExpression
+        )
+        return normalized
+    }
 
 	/**
 	 Test if the input HTML has only tags and attributes allowed by the Whitelist. Useful for form validation. The input HTML should

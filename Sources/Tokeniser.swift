@@ -31,10 +31,23 @@ final class Tokeniser {
     private static let regCodepoints: [UnicodeScalar] = [UnicodeScalar(TokeniserStateVars.regCodepoint)!]
     private static let tradeCodepoints: [UnicodeScalar] = [UnicodeScalar(TokeniserStateVars.tradeCodepoint)!]
     private static let replacementCodepoints: [UnicodeScalar] = [Tokeniser.replacementChar]
-    private static let numericCharRefCache: [[UnicodeScalar]] = {
-        var cache = Array(repeating: [UnicodeScalar](), count: 256)
-        for i in 0..<256 {
-            cache[i] = [UnicodeScalar(i)!]
+    private static let literalNumericCharRefCache: [[UnicodeScalar]] = {
+        return (0..<256).map { [UnicodeScalar($0)!] }
+    }()
+    private static let htmlNumericCharRefCache: [[UnicodeScalar]] = {
+        var cache = literalNumericCharRefCache
+        // Cache the HTML numeric-reference result, not the input scalar. This
+        // keeps short decimal and general decimal/hex paths consistent without
+        // adding per-reference normalization work to the hot path.
+        cache[0] = [Tokeniser.replacementChar]
+        let c1Replacements: [UInt32] = [
+            0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+            0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
+            0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+            0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178
+        ]
+        for (offset, scalar) in c1Replacements.enumerated() {
+            cache[0x80 + offset] = [UnicodeScalar(scalar)!]
         }
         return cache
     }()
@@ -149,6 +162,9 @@ final class Tokeniser {
     }
 
     
+    // Choose the numeric-reference policy once per tokenizer, not per scalar.
+    // Case-preserving HTML still uses HTML mappings; XML keeps literal values.
+    private let numericCharRefCache: [[UnicodeScalar]]
     private let reader: CharacterReader // html input
     private let errors: ParseErrorList? // errors found while tokenising
     
@@ -157,9 +173,9 @@ final class Tokeniser {
     private var isEmitPendingFast: Bool = false
     private var emitPending: Token?  // the token we are about to emit on next read
     private var isEmitPending: Bool = false
-    private var charsSlice: ArraySlice<UInt8>? = nil // single pending slice to avoid array allocation
+    private var charsSlice: ByteSlice? = nil // single pending slice to avoid array allocation
     private var charsSliceFromInput: Bool = false
-    private var pendingSlices = [ArraySlice<UInt8>]()
+    private var pendingSlices = [ByteSlice]()
     private var pendingSlicesCount: Int = 0
     private var pendingCharRange: SourceRange? = nil
     private var pendingTagStartPos: Int? = nil
@@ -181,6 +197,7 @@ final class Tokeniser {
     let lowercaseTagNames: Bool
     private let trackSourceRanges: Bool
     private let trackErrors: Bool
+    private let isXmlParser: Bool
     let trackAttributes: Bool
 
     @inline(__always)
@@ -188,7 +205,10 @@ final class Tokeniser {
         return trackSourceRanges
     }
     
-    init(_ reader: CharacterReader, _ errors: ParseErrorList?, _ settings: ParseSettings? = nil) {
+    init(_ reader: CharacterReader, _ errors: ParseErrorList?, _ settings: ParseSettings? = nil,
+         isXmlParser: Bool = false, normalizesHtmlNumericReferences: Bool = true) {
+        self.isXmlParser = isXmlParser
+        numericCharRefCache = normalizesHtmlNumericReferences ? Self.htmlNumericCharRefCache : Self.literalNumericCharRefCache
         self.reader = reader
         self.errors = errors
         trackErrors = errors?.getMaxSize() ?? 0 > 0
@@ -204,6 +224,25 @@ final class Tokeniser {
             lowercaseTagNames = false
             trackSourceRanges = true
             trackAttributes = true
+        }
+    }
+
+    @inline(__always)
+    func matchesTagStart(_ byte: UInt8) -> Bool {
+        if TokeniserStateVars.isAsciiAlpha(byte) { return true }
+        guard isXmlParser else { return false }
+        if byte < TokeniserStateVars.asciiUpperLimitByte {
+            return byte == TokeniserStateVars.colonByte || byte == TokeniserStateVars.underscoreByte
+        }
+        // XML 1.0 (Fifth Edition), production [4] NameStartChar. The reader's
+        // EOF/error sentinel U+FFFF is outside these ranges.
+        switch reader.current().value {
+        case 0xC0...0xD6, 0xD8...0xF6, 0xF8...0x2FF, 0x370...0x37D,
+             0x37F...0x1FFF, 0x200C...0x200D, 0x2070...0x218F, 0x2C00...0x2FEF,
+             0x3001...0xD7FF, 0xF900...0xFDCF, 0xFDF0...0xFFFD, 0x10000...0xEFFFF:
+            return true
+        default:
+            return false
         }
     }
 
@@ -238,10 +277,6 @@ final class Tokeniser {
     }
     
     func read() throws -> Token {
-        #if PROFILE
-        let _p = Profiler.start("Tokeniser.read")
-        defer { Profiler.end("Tokeniser.read", _p) }
-        #endif
         if (!selfClosingFlagAcknowledged) {
             if trackErrors {
                 error("Self closing flag not acknowledged")
@@ -249,9 +284,6 @@ final class Tokeniser {
             selfClosingFlagAcknowledged = true
         }
         
-        #if PROFILE
-        let _pLoop = Profiler.start("Tokeniser.read.loop")
-        #endif
         while (!isEmitPendingFast) {
             if isDataState {
                 if trackSourceRanges {
@@ -267,15 +299,8 @@ final class Tokeniser {
             }
             try state.read(self, reader)
         }
-        #if PROFILE
-        Profiler.end("Tokeniser.read.loop", _pLoop)
-        #endif
         
         if !charsBuilder.isEmpty {
-            #if PROFILE
-            let _pEmit = Profiler.start("Tokeniser.read.emitBuilder")
-            defer { Profiler.end("Tokeniser.read.emitBuilder", _pEmit) }
-            #endif
             let str = charsBuilder.takeBuffer()
             // Clear any pending slices, as the builder takes precedence.
             charsSlice = nil
@@ -286,20 +311,12 @@ final class Tokeniser {
             pendingCharRange = nil
             return charPending.data(str)
         } else if let slice = charsSlice {
-            #if PROFILE
-            let _pEmit = Profiler.start("Tokeniser.read.emitSlice")
-            defer { Profiler.end("Tokeniser.read.emitSlice", _pEmit) }
-            #endif
             charsSlice = nil
             charsSliceFromInput = false
             charPending.sourceRange = pendingCharRange
             pendingCharRange = nil
             return charPending.data(slice)
         } else if !pendingSlices.isEmpty {
-            #if PROFILE
-            let _pEmit = Profiler.start("Tokeniser.read.emitSlices")
-            defer { Profiler.end("Tokeniser.read.emitSlices", _pEmit) }
-            #endif
             if pendingSlices.count == 1 {
                 let slice = pendingSlices[0]
                 pendingSlices.removeAll(keepingCapacity: true)
@@ -344,10 +361,6 @@ final class Tokeniser {
                 }
             }
         } else {
-            #if PROFILE
-            let _pEmit = Profiler.start("Tokeniser.read.emitToken")
-            defer { Profiler.end("Tokeniser.read.emitToken", _pEmit) }
-            #endif
             isEmitPending = false
             isEmitPendingFast = false
             pendingCharRange = nil
@@ -401,48 +414,17 @@ final class Tokeniser {
     }
 
     @inline(__always)
-    private func consumeDataTracked() -> ArraySlice<UInt8> {
-        return reader.consumeData()
+    private func consumeDataTracked() -> ByteSlice {
+        return reader.consumeDataSlice()
     }
 
     @inline(__always)
     private func readDataStateTracked() throws {
-        #if PROFILE
-        let _p = Profiler.start("TokeniserState.Data")
-        defer { Profiler.end("TokeniserState.Data", _p) }
-        #endif
-        let remaining = reader.end - reader.pos
-        if reader.canSkipNullCheck, remaining >= 64 {
+        if reader.pos < reader.end {
             let first = reader.input[reader.pos]
             if first == TokeniserStateVars.ampersandByte ||
-                first == TokeniserStateVars.lessThanByte {
-                try handleDataStateDelimiterTracked()
-                return
-            }
-            let dataStart = reader.pos
-            let data = remaining >= 128 ? reader.consumeDataFastNoNull() : reader.consumeData()
-            if !data.isEmpty {
-                let dataEnd = reader.pos
-                emitRaw(data, start: dataStart, end: dataEnd)
-                return
-            }
-            if reader.pos >= reader.end {
-                try emitEOF()
-                return
-            }
-            try handleDataStateDelimiterTracked()
-            return
-        } else if reader.pos < reader.end {
-            let first = reader.input[reader.pos]
-            if reader.canSkipNullCheck {
-                if first == TokeniserStateVars.ampersandByte ||
-                    first == TokeniserStateVars.lessThanByte {
-                    try handleDataStateDelimiterTracked()
-                    return
-                }
-            } else if first == TokeniserStateVars.ampersandByte ||
-                        first == TokeniserStateVars.lessThanByte ||
-                        first == TokeniserStateVars.nullByte {
+                first == TokeniserStateVars.lessThanByte ||
+                first == TokeniserStateVars.nullByte {
                 try handleDataStateDelimiterTracked()
                 return
             }
@@ -480,7 +462,7 @@ final class Tokeniser {
                 return
             }
             let next = reader.input[reader.pos]
-            if next < TokeniserStateVars.asciiUpperLimitByte, TokeniserStateVars.isAsciiAlpha(next) {
+            if matchesTagStart(next) {
                 if try TokeniserState.readTagNameFromTagOpen(self, reader, true) {
                     return
                 }
@@ -499,26 +481,13 @@ final class Tokeniser {
                     return
                 }
                 let endByte = reader.currentByte()!
-                if endByte < TokeniserStateVars.asciiUpperLimitByte {
-                    if TokeniserStateVars.isAsciiAlpha(endByte) {
-                        if try TokeniserState.readTagNameFromTagOpen(self, reader, false) {
-                            return
-                        }
-                        return
-                    }
-                    if endByte == TokeniserStateVars.greaterThanByte {
-                        error(.Data)
-                        clearTagStart()
-                        advanceTransition(.Data)
-                    } else {
-                        error(.Data)
-                        clearTagStart()
-                        advanceTransition(.BogusComment)
-                    }
-                } else if reader.matchesLetter() {
-                    createTagPending(false)
-                    try TokeniserState.readTagName(.TagName, self, reader)
+                if matchesTagStart(endByte) {
+                    _ = try TokeniserState.readTagNameFromTagOpen(self, reader, false)
                     return
+                } else if endByte == TokeniserStateVars.greaterThanByte {
+                    error(.Data)
+                    clearTagStart()
+                    advanceTransition(.Data)
                 } else {
                     error(.Data)
                     clearTagStart()
@@ -527,11 +496,6 @@ final class Tokeniser {
             case TokeniserStateVars.questionMarkByte: // "?"
                 advanceTransitionAscii(.BogusComment)
             default:
-                if next >= TokeniserStateVars.asciiUpperLimitByte, reader.matchesLetter() {
-                    createTagPending(true)
-                    try TokeniserState.readTagName(.TagName, self, reader)
-                    return
-                }
                 error(.Data)
                 emit(UnicodeScalar.LessThan)
                 transition(.Data)
@@ -551,41 +515,14 @@ final class Tokeniser {
             try emitEOF()
             return
         }
-        let remaining = reader.end - reader.pos
-        if reader.canSkipNullCheck, remaining >= 64 {
-            let first = reader.input[reader.pos]
-            if first == TokeniserStateVars.ampersandByte ||
-                first == TokeniserStateVars.lessThanByte {
-                try handleDataStateDelimiter()
-                return
-            }
-            let data = remaining >= 128 ? reader.consumeDataFastNoNull() : reader.consumeData()
-            if !data.isEmpty {
-                emitInputSlice(data)
-                return
-            }
-            if reader.pos >= reader.end {
-                try emitEOF()
-                return
-            }
+        let first = reader.input[reader.pos]
+        if first == TokeniserStateVars.ampersandByte ||
+            first == TokeniserStateVars.lessThanByte ||
+            first == TokeniserStateVars.nullByte {
             try handleDataStateDelimiter()
             return
-        } else {
-            let first = reader.input[reader.pos]
-            if reader.canSkipNullCheck {
-                if first == TokeniserStateVars.ampersandByte ||
-                    first == TokeniserStateVars.lessThanByte {
-                    try handleDataStateDelimiter()
-                    return
-                }
-            } else if first == TokeniserStateVars.ampersandByte ||
-                        first == TokeniserStateVars.lessThanByte ||
-                        first == TokeniserStateVars.nullByte {
-                try handleDataStateDelimiter()
-                return
-            }
         }
-        let data = reader.consumeData()
+        let data = reader.consumeDataSlice()
         if !data.isEmpty {
             emitInputSlice(data)
             return
@@ -614,7 +551,7 @@ final class Tokeniser {
                 return
             }
             let next = reader.input[reader.pos]
-            if next < TokeniserStateVars.asciiUpperLimitByte, TokeniserStateVars.isAsciiAlpha(next) {
+            if matchesTagStart(next) {
                 if try TokeniserState.readTagNameFromTagOpen(self, reader, true) {
                     return
                 }
@@ -632,24 +569,12 @@ final class Tokeniser {
                     return
                 }
                 let endByte = reader.currentByte()!
-                if endByte < TokeniserStateVars.asciiUpperLimitByte {
-                    if TokeniserStateVars.isAsciiAlpha(endByte) {
-                        if try TokeniserState.readTagNameFromTagOpen(self, reader, false) {
-                            return
-                        }
-                        return
-                    }
-                    if endByte == TokeniserStateVars.greaterThanByte {
-                        error(.Data)
-                        advanceTransition(.Data)
-                    } else {
-                        error(.Data)
-                        advanceTransition(.BogusComment)
-                    }
-                } else if reader.matchesLetter() {
-                    createTagPending(false)
-                    try TokeniserState.readTagName(.TagName, self, reader)
+                if matchesTagStart(endByte) {
+                    _ = try TokeniserState.readTagNameFromTagOpen(self, reader, false)
                     return
+                } else if endByte == TokeniserStateVars.greaterThanByte {
+                    error(.Data)
+                    advanceTransition(.Data)
                 } else {
                     error(.Data)
                     advanceTransition(.BogusComment)
@@ -657,11 +582,6 @@ final class Tokeniser {
             case TokeniserStateVars.questionMarkByte: // "?"
                 advanceTransitionAscii(.BogusComment)
             default:
-                if next >= TokeniserStateVars.asciiUpperLimitByte, reader.matchesLetter() {
-                    createTagPending(true)
-                    try TokeniserState.readTagName(.TagName, self, reader)
-                    return
-                }
                 error(.Data)
                 emit(UnicodeScalar.LessThan)
                 transition(.Data)
@@ -676,7 +596,7 @@ final class Tokeniser {
     }
 
     @inline(__always)
-    func emitRaw(_ str: ArraySlice<UInt8>, start: Int, end: Int) {
+    func emitRaw(_ str: ByteSlice, start: Int, end: Int) {
         if trackSourceRanges {
             if charsBuilder.isEmpty && charsSlice == nil && pendingSlices.isEmpty {
                 pendingCharRange = SourceRange(start: start, end: end)
@@ -690,13 +610,13 @@ final class Tokeniser {
     }
 
     @inline(__always)
-    func emitRaw(_ str: ArraySlice<UInt8>) {
+    func emitRaw(_ str: ByteSlice) {
         pendingCharRange = nil
         emitInputSlice(str)
     }
     
     @inline(__always)
-    private func emitInputSlice(_ str: ArraySlice<UInt8>) {
+    private func emitInputSlice(_ str: ByteSlice) {
         if pendingCharRange != nil, (!charsBuilder.isEmpty || charsSlice != nil || !pendingSlices.isEmpty) {
             pendingCharRange = nil
         }
@@ -705,8 +625,8 @@ final class Tokeniser {
             return
         }
         if let existing = charsSlice {
-            if charsSliceFromInput, existing.endIndex == str.startIndex {
-                charsSlice = reader.input[existing.startIndex..<str.endIndex]
+            if charsSliceFromInput, existing.end == str.start {
+                charsSlice = reader.slice(existing.start, str.end)
                 return
             }
             if pendingSlices.isEmpty {
@@ -726,7 +646,7 @@ final class Tokeniser {
         }
     }
 
-    func emit(_ str: ArraySlice<UInt8>) {
+    func emit(_ str: ByteSlice) {
         if pendingCharRange != nil, (!charsBuilder.isEmpty || charsSlice != nil || !pendingSlices.isEmpty) {
             pendingCharRange = nil
         }
@@ -753,7 +673,11 @@ final class Tokeniser {
     }
     
     func emit(_ str: [UInt8]) {
-        emit(str[...]) // Call the slice version with the full array as a slice
+        emit(ByteSlice.fromArray(str))
+    }
+
+    func emit(_ str: ArraySlice<UInt8>) {
+        emit(ByteSlice.fromArraySlice(str))
     }
     
     func emit(_ str: String) {
@@ -842,10 +766,6 @@ final class Tokeniser {
     }
     
     func consumeCharacterReference(_ additionalAllowedCharacter: UnicodeScalar?, _ inAttribute: Bool) throws -> [UnicodeScalar]? {
-        #if PROFILE
-        let _p = Profiler.start("Tokeniser.consumeCharacterReference")
-        defer { Profiler.end("Tokeniser.consumeCharacterReference", _p) }
-        #endif
         if (reader.isEmpty()) {
             return nil
         }
@@ -920,7 +840,7 @@ final class Tokeniser {
                                         let value = Int(d1 - TokeniserStateVars.zeroByte) * 10 + Int(d2 - TokeniserStateVars.zeroByte)
                                         reader.pos = i + 2
                                         reader.advanceAscii()
-                                        return Self.numericCharRefCache[value]
+                                        return numericCharRefCache[value]
                                     }
                                     if d3 >= TokeniserStateVars.zeroByte && d3 <= TokeniserStateVars.nineByte, i + 3 <= maxIndex,
                                        reader.input[i + 3] == TokeniserStateVars.semicolonByte {
@@ -930,7 +850,7 @@ final class Tokeniser {
                                         reader.pos = i + 3
                                         reader.advanceAscii()
                                         if value < 256 {
-                                            return Self.numericCharRefCache[value]
+                                            return numericCharRefCache[value]
                                         }
                                         return [UnicodeScalar(value)!]
                                     }
@@ -939,7 +859,7 @@ final class Tokeniser {
                                 let value = Int(d1 - TokeniserStateVars.zeroByte)
                                 reader.pos = i + 1
                                 reader.advanceAscii()
-                                return Self.numericCharRefCache[value]
+                                return numericCharRefCache[value]
                             }
                         }
                     }
@@ -990,7 +910,7 @@ final class Tokeniser {
                 return Self.replacementCodepoints
             }
             if charval >= 0, charval < 256 {
-                return Self.numericCharRefCache[charval]
+                return numericCharRefCache[charval]
             }
             return [UnicodeScalar(charval)!]
         }
@@ -999,7 +919,7 @@ final class Tokeniser {
         reader.markPos()
         do {
             @inline(__always)
-            func fastNamedEntity(_ name: [UInt8], _ codepoints: [UnicodeScalar]) -> [UnicodeScalar]? {
+            func fastNamedEntity(_ name: [UInt8], _ codepoints: [UnicodeScalar], requiresSemicolon: Bool = false) -> [UnicodeScalar]? {
                 let pos = reader.pos
                 let end = reader.end
                 let input = reader.input
@@ -1009,6 +929,11 @@ final class Tokeniser {
                     if input[pos + i] != name[i] { return nil }
                 }
                 let nextIndex = pos + count
+                // Unlike the legacy amp/lt/gt/quot names, apos is only defined
+                // with a terminator. Reject before changing the reader cursor.
+                if requiresSemicolon && (nextIndex == end || input[nextIndex] != TokeniserStateVars.semicolonByte) {
+                    return nil
+                }
                 if nextIndex < end {
                     let nb = input[nextIndex]
                     if nb >= TokeniserStateVars.asciiUpperLimitByte { return nil } // let slow path handle unicode letters/digits
@@ -1032,7 +957,7 @@ final class Tokeniser {
                 switch b {
                 case TokeniserStateVars.lowerAByte: // a
                     if let fast = fastNamedEntity(Self.ampName, Self.ampCodepoints) { return fast }
-                    if let fast = fastNamedEntity(Self.aposName, Self.aposCodepoints) { return fast }
+                    if let fast = fastNamedEntity(Self.aposName, Self.aposCodepoints, requiresSemicolon: true) { return fast }
                 case TokeniserStateVars.lowerLByte: // l
                     if let fast = fastNamedEntity(Self.ltName, Self.ltCodepoints) { return fast }
                 case TokeniserStateVars.lowerGByte: // g
@@ -1044,7 +969,7 @@ final class Tokeniser {
                 }
             }
              // get as many letters as possible, and look for matching entities.
-            let nameRef: ArraySlice<UInt8>
+            let nameRef: ByteSlice
             if let b = reader.currentByte(), b < TokeniserStateVars.asciiUpperLimitByte,
                TokeniserStateVars.isAsciiAlpha(b) {
                 let start = reader.pos
@@ -1078,13 +1003,13 @@ final class Tokeniser {
                 }
                 if hitNonAscii {
                     reader.pos = start
-                    nameRef = reader.consumeLetterThenDigitSequence()
+                    nameRef = reader.consumeLetterThenDigitSequenceSlice()
                 } else {
                     reader.pos = j
-                    nameRef = reader.input[start..<j]
+                    nameRef = reader.slice(start, j)
                 }
             } else {
-                nameRef = reader.consumeLetterThenDigitSequence()
+                nameRef = reader.consumeLetterThenDigitSequenceSlice()
             }
             let looksLegit: Bool = (reader.currentByte() == UTF8Arrays.semicolon[0])
             let points = Entities.lookupNamedEntity(nameRef, allowExtended: looksLegit)
@@ -1146,6 +1071,7 @@ final class Tokeniser {
     
     @inlinable
     func emitTagPending() throws {
+        finaliseAttributeName()
         try tagPending.finaliseTag()
         if trackSourceRanges, let start = pendingTagStartPos {
             tagPending.sourceRange = SourceRange(start: start, end: reader.pos)
@@ -1154,6 +1080,13 @@ final class Tokeniser {
         }
         pendingTagStartPos = nil
         try emit(tagPending)
+    }
+
+    @inline(__always)
+    func finaliseAttributeName() {
+        if tagPending.finaliseAttributeName() && trackErrors {
+            error("Duplicate attribute")
+        }
     }
     
     func createCommentPending() {
@@ -1226,7 +1159,7 @@ final class Tokeniser {
     }
 
     @inline(__always)
-    private static func equalsIgnoreCase(_ lhs: ArraySlice<UInt8>, _ rhs: [UInt8]) -> Bool {
+    private static func equalsIgnoreCase(_ lhs: ByteSlice, _ rhs: [UInt8]) -> Bool {
         if lhs.count != rhs.count {
             return false
         }
@@ -1292,13 +1225,9 @@ final class Tokeniser {
      - returns: unescaped string from reader
      */
     func unescapeEntities(_ inAttribute: Bool) throws -> [UInt8] {
-        #if PROFILE
-        let _p = Profiler.start("Tokeniser.unescapeEntities")
-        defer { Profiler.end("Tokeniser.unescapeEntities", _p) }
-        #endif
         let builder: StringBuilder = StringBuilder()
         while (!reader.isEmpty()) {
-            builder.append(reader.consumeTo(UnicodeScalar.Ampersand))
+            builder.append(reader.consumeToAnyOfOneSlice(TokeniserStateVars.ampersandByte))
             if reader.matches(UnicodeScalar.Ampersand) {
                 reader.consume()
                 if let c = try consumeCharacterReference(nil, inAttribute) {

@@ -109,22 +109,56 @@ public class Parser {
 	 
 	 - returns: parsed Document
 	*/
-	public static func parse(_ html: [UInt8], _ baseUri: [UInt8]) throws -> Document {
-		let treeBuilder: TreeBuilder = HtmlTreeBuilder()
-		return try treeBuilder.parse(html, baseUri, ParseErrorList.noTracking(), treeBuilder.defaultSettings())
-	}
+    public static func parse(_ html: [UInt8], _ baseUri: [UInt8]) throws -> Document {
+        let treeBuilder = HtmlTreeBuilder()
+        return try treeBuilder.parse(html, baseUri, ParseErrorList.noTracking(), treeBuilder.defaultSettings())
+    }
+
+    public static func parse(_ html: UnsafeBufferPointer<UInt8>, _ baseUri: [UInt8]) throws -> Document {
+        let treeBuilder = HtmlTreeBuilder()
+        return try treeBuilder.parse(html, owner: nil, baseUri, ParseErrorList.noTracking(), treeBuilder.defaultSettings())
+    }
+
+    public static func parse(_ html: UnsafeBufferPointer<UInt8>, owner: AnyObject, _ baseUri: [UInt8]) throws -> Document {
+        let treeBuilder = HtmlTreeBuilder()
+        return try treeBuilder.parse(html, owner: owner, baseUri, ParseErrorList.noTracking(), treeBuilder.defaultSettings())
+    }
     
     public static func parse(_ html: String, _ baseUri: String) throws -> Document {
         return try parse(html.utf8Array, baseUri.utf8Array)
     }
 
     public static func parse(_ data: Data, _ baseUri: [UInt8]) throws -> Document {
-        let treeBuilder: TreeBuilder = HtmlTreeBuilder()
+        let treeBuilder = HtmlTreeBuilder()
         return try treeBuilder.parse([UInt8](data), baseUri, ParseErrorList.noTracking(), treeBuilder.defaultSettings())
     }
 
     public static func parse(_ data: Data, _ baseUri: String) throws -> Document {
         return try parse([UInt8](data), baseUri.utf8Array)
+    }
+
+    public static func parse(_ baseUri: [UInt8],
+                             withBytes provider: (_ parse: (UnsafeBufferPointer<UInt8>) throws -> Document) throws -> Document) rethrows -> Document {
+        return try provider { buffer in
+            return try Parser.parse(buffer, baseUri)
+        }
+    }
+
+    public static func parse(_ baseUri: [UInt8],
+                             withBytesOwned provider: (_ parse: (UnsafeBufferPointer<UInt8>, AnyObject) throws -> Document) throws -> Document) rethrows -> Document {
+        return try provider { buffer, owner in
+            return try Parser.parse(buffer, owner: owner, baseUri)
+        }
+    }
+
+    public static func parse(_ baseUri: String,
+                             withBytes provider: (_ parse: (UnsafeBufferPointer<UInt8>) throws -> Document) throws -> Document) rethrows -> Document {
+        return try parse(baseUri.utf8Array, withBytes: provider)
+    }
+
+    public static func parse(_ baseUri: String,
+                             withBytesOwned provider: (_ parse: (UnsafeBufferPointer<UInt8>, AnyObject) throws -> Document) throws -> Document) rethrows -> Document {
+        return try parse(baseUri.utf8Array, withBytesOwned: provider)
     }
 
 	/**
@@ -137,10 +171,10 @@ public class Parser {
 	 
 	 - returns: list of nodes parsed from the input HTML. Note that the context element, if supplied, is not modified.
 	*/
-	public static func parseFragment(_ fragmentHtml: [UInt8], _ context: Element?, _ baseUri: [UInt8]) throws -> Array<Node> {
-		let treeBuilder = HtmlTreeBuilder()
-		return try treeBuilder.parseFragment(fragmentHtml, context, baseUri, ParseErrorList.noTracking(), treeBuilder.defaultSettings())
-	}
+    public static func parseFragment(_ fragmentHtml: [UInt8], _ context: Element?, _ baseUri: [UInt8]) throws -> Array<Node> {
+        let treeBuilder = HtmlTreeBuilder()
+        return try treeBuilder.parseFragment(fragmentHtml, context, baseUri, ParseErrorList.noTracking(), treeBuilder.defaultSettings())
+    }
     
     public static func parseFragment(_ fragmentHtml: String, _ context: Element?, _ baseUri: [UInt8]) throws -> Array<Node> {
         return try parseFragment(fragmentHtml.utf8Array, context, baseUri)
@@ -154,10 +188,10 @@ public class Parser {
 	 - returns: list of nodes parsed from the input XML.
 	*/
 	public static func parseXmlFragment(_ fragmentXml: [UInt8], _ baseUri: [UInt8]) throws -> Array<Node> {
-		let treeBuilder: XmlTreeBuilder = XmlTreeBuilder()
+		let treeBuilder = XmlTreeBuilder()
 		return try treeBuilder.parseFragment(fragmentXml, baseUri, ParseErrorList.noTracking(), treeBuilder.defaultSettings())
 	}
-    
+
     public static func parseXmlFragment(_ fragmentXml: String, _ baseUri: String) throws -> Array<Node> {
         return try parseXmlFragment(fragmentXml.utf8Array, baseUri.utf8Array)
     }
@@ -171,18 +205,27 @@ public class Parser {
 	 - returns: Document, with empty head, and HTML parsed into body
 	*/
 	public static func parseBodyFragment(_ bodyHtml: String, _ baseUri: String) throws -> Document {
-		let doc: Document = Document.createShell(baseUri)
-		if let body: Element = doc.body() {
+        let doc: Document = Document.createShell(baseUri)
+        if let body: Element = doc.body() {
             let nodeList: Array<Node> = try parseFragment(bodyHtml, body, baseUri.utf8Array)
 			//var nodes: [Node] = nodeList.toArray(Node[nodeList.size()]) // the node list gets modified when re-parented
-            if nodeList.count > 0 {
-                for i in 1..<nodeList.count {
-                    try nodeList[i].remove()
+            if body.childNodes.isEmpty {
+                body.childNodes.reserveCapacity(nodeList.count)
+                var i = 0
+                for node in nodeList {
+                    node.parentNode = body
+                    node.treeBuilder = body.treeBuilder
+                    node.setSiblingIndex(i)
+                    body.childNodes.append(node)
+                    i &+= 1
+                }
+                body.markSourceDirty()
+                body.bumpTextMutationVersion()
+            } else {
+                for node: Node in nodeList {
+                    try body.appendChild(node)
                 }
             }
-			for node: Node in nodeList {
-				try body.appendChild(node)
-			}
 		}
 		return doc
 	}
